@@ -231,3 +231,56 @@ fn verify_task_emits_accept_report_reaches_verified_and_surfaces_contracts() {
     assert_eq!(cs[1]["contract"], "C-P2");
     assert_eq!(cs[1]["verdict"], "fail");
 }
+
+/// A NON-verify (merge) task whose gate writes accept_report.json surfaces
+/// the per-contract verdicts on the MERGED receipt (the merge path reads the
+/// report before cleanup). spec: lifecycle/verify-tasks#accept-report-rides-merge
+#[test]
+fn merged_task_surfaces_accept_report_contracts() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var("FAKE_AGENT_EXIT");
+    std::env::remove_var("FAKE_AGENT_TOUCH");
+    std::env::remove_var("FAKE_AGENT_OUT");
+    let gate = format!(
+        "{} && printf '%s' '{{\\\"C-P2\\\":\\\"fail\\\",\\\"C-M1\\\":\\\"pass\\\"}}' > accept_report.json",
+        gate_cmd("DONE.txt")
+    );
+    let f = fixture(
+        &format!(
+            r#"{{ "tasks": [ {{ "id":"A","title":"merge contracts","scope":["DONE.txt"],"accept":"{g}" }} ] }}"#,
+            g = gate
+        ),
+        &worker_json(1),
+    );
+    assert_eq!(run::run_loop(&f.cfg, &f.st, &RunOptions::default()), 0);
+
+    // 1) Merged (NOT verified): the task's change lands on base.
+    let st = Store::new(f.st.state_dir.clone()).load();
+    assert_eq!(st["A"].state, TaskState::Done, "merge task ends done");
+    assert!(
+        f.repo.join("DONE.txt").exists(),
+        "a merge task really merges (contrast with verify)"
+    );
+
+    // 2) The receipt is `merged` AND carries the per-contract verdicts.
+    let receipts = Store::new(f.st.state_dir.clone()).load_receipts();
+    assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
+    assert_eq!(receipts[0].outcome, "merged", "receipt records merged");
+    let contracts = receipts[0]
+        .contracts
+        .as_ref()
+        .expect("accept_report.json surfaces on the MERGED receipt");
+    assert_eq!(contracts.len(), 2, "both contracts recorded");
+    // Sorted by contract key (BTreeMap): C-M1 then C-P2.
+    assert_eq!(contracts[0].contract, "C-M1");
+    assert_eq!(contracts[0].verdict, "pass");
+    assert_eq!(contracts[1].contract, "C-P2");
+    assert_eq!(contracts[1].verdict, "fail");
+
+    // 3) Nothing archived: merged tasks never archive the branch.
+    assert_eq!(
+        archived_refs(&f.repo, "A").len(),
+        0,
+        "a merged task archives nothing"
+    );
+}
