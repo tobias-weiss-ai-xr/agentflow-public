@@ -141,7 +141,7 @@ pub fn execute_task(
     outcome
 }
 
-/// Best-effort per-contract acceptance report (verify tasks). Reads
+/// Best-effort per-contract acceptance report (verify AND merged tasks). Reads
 /// `accept_report.json` from the worktree root (the gate's cwd). The file is
 /// an object `{"C-M1":"pass","C-M2":"fail",...}`. Missing, empty (an empty
 /// object `{}` or an empty file), or unparseable reports yield `None` and NEVER
@@ -779,8 +779,13 @@ fn execute_attempt(
         );
     }
     append("-- merged --");
+    // Per-contract verdicts ride the merged receipt too: the gate wrote
+    // accept_report.json in the worktree root; read it BEFORE cleanup (which
+    // deletes the worktree dir). Absent/unparseable report -> None, exactly
+    // like the verify path - the file is optional detail, never authority.
+    let contracts = parse_accept_report(&wt_path);
     cleanup(&repo, &wt);
-    (Outcome::Merged, spend, None)
+    (Outcome::Merged, spend, contracts)
 }
 
 fn cleanup(repo: &Path, wt: &worktree::Worktree) {
