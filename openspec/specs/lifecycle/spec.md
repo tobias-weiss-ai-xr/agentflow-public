@@ -173,8 +173,11 @@ parsed best-effort into per-contract verdicts stored on the receipt, surfaced
 in `status --json` (the `verify`, `verdict` and `contracts` fields) and seeded
 into retry prompts as a `failing contracts:` line in the "Previous attempts"
 block; a report that is absent or unparsable SHALL NOT fail the attempt.
-Validation SHALL reject a task that declares `verify` together with `manual` or
-`readonly`, or that declares `verify` without an `accept` gate.
+The same `accept_report.json` is parsed on the merged path — its verdicts
+ride the merged receipt's `contracts` field and surface in `status --json`
+(a merge is a success, so there is no retry prompt to seed). Validation SHALL
+reject a task that declares `verify` together with `manual` or `readonly`, or
+that declares `verify` without an `accept` gate.
 
 #### Scenario: verify task passes and archives
 
@@ -186,6 +189,12 @@ THEN the branch is archived as `<branch>-rejected-<now>` and never merged, and t
 
 GIVEN a `verify: true` task whose acceptance gate exits non-zero
 THEN the receipt records the failure (never `verified`), the branch is archived for retry, and no merge happens.
+
+#### Scenario: a merged task's gate writes an acceptance report
+
+GIVEN a non-verify task whose acceptance gate writes `accept_report.json` and exits 0
+WHEN the attempt merges
+THEN the per-contract verdicts are parsed best-effort onto the merged receipt's `contracts` field and surfaced in `status --json`, and a missing or unparsable report does not fail the merge.
 
 ### Requirement: Pre-dispatch reuse of an archived branch
 

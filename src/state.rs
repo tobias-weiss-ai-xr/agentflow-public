@@ -142,7 +142,7 @@ pub struct Receipt {
     #[serde(default)]
     pub cost_micros: Option<u64>,
     /// Per-contract verdicts from an optional `accept_report.json`
-    /// (verify tasks). `None` when no report was present/parseable.
+    /// (verify AND merged tasks). `None` when no report was present/parseable.
     #[serde(default)]
     pub contracts: Option<Vec<ContractVerdict>>,
 }
