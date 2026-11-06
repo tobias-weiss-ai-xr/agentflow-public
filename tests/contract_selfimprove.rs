@@ -232,6 +232,83 @@ fn verify_task_emits_accept_report_reaches_verified_and_surfaces_contracts() {
     assert_eq!(cs[1]["verdict"], "fail");
 }
 
+/// A `verify: true` task whose gate FAILS is recorded `failed` (never
+/// `verified`), never merges (the base branch stays clean), and reports
+/// `verdict: "failed"` through `af status --json` with no contracts. The
+/// agent's committed work is kept durable on the attempt branch for a
+/// gate-only retry (the first failure is NOT archived as
+/// `<branch>-rejected-*` -- that archive happens only when the work is
+/// ultimately discarded), so no `tf/A-rejected-*` ref appears. This is the
+/// failure-side counterpart to the passing-gate test above, confirming the
+/// verify contract end-to-end on the current main.
+// spec: lifecycle/verify-tasks#verify-task-gate-fails
+#[test]
+fn verify_task_gate_failure_is_failed_not_verified_and_never_merges() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var("FAKE_AGENT_EXIT");
+    std::env::remove_var("FAKE_AGENT_TOUCH");
+    std::env::remove_var("FAKE_AGENT_OUT");
+    // The gate looks for NEVER.txt, which the agent never creates, so the
+    // gate exits non-zero. The agent still writes DONE.txt (the orchestrator
+    // commits it on the attempt branch), but a verify task's gate failure is
+    // `failed`, never `verified`, and the base branch is untouched.
+    let gate = gate_cmd("NEVER.txt");
+    let f = fixture(
+        &format!(
+            r#"{{ "tasks": [ {{"id":"A","title":"verify it","verify":true,"scope":["DONE.txt"],"accept":"{g}"}} ] }}"#,
+            g = gate
+        ),
+        &worker_json(1),
+    );
+    // A gate failure ends the run with a non-zero exit (the task failed).
+    assert_eq!(run::run_loop(&f.cfg, &f.st, &RunOptions::default()), 2);
+
+    // 1) The task ends Failed (NOT Done/verified) and the base is untouched.
+    let st = Store::new(f.st.state_dir.clone()).load();
+    assert_eq!(st["A"].state, TaskState::Failed, "verify gate failure is failed");
+    assert!(
+        !f.repo.join("DONE.txt").exists(),
+        "a failed verify gate never merges"
+    );
+
+    // 2) The receipt records `failed`, never `verified`, with no contracts
+    //    (the gate failed before any accept_report.json could be parsed).
+    let receipts = Store::new(f.st.state_dir.clone()).load_receipts();
+    assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
+    assert_eq!(receipts[0].outcome, "failed", "gate failure is failed, not verified");
+    assert!(
+        receipts[0].contracts.is_none(),
+        "a failed gate writes no accept_report.json contracts"
+    );
+
+    // 3) `af status --json` surfaces `verify: true` and `verdict: "failed"`
+    //    (NOT "verified"), with an empty contracts array.
+    let json = run::status_json(&f.cfg, &f.st);
+    let v: serde_json::Value =
+        serde_json::from_str(&json).expect("status --json is valid JSON");
+    let task = v
+        .get("A")
+        .and_then(|t| t.as_object())
+        .unwrap_or_else(|| panic!("task A present as object: {json}"));
+    assert_eq!(
+        task.get("verify").and_then(|x| x.as_bool()),
+        Some(true),
+        "status surfaces verify flag even on failure"
+    );
+    assert_eq!(
+        task.get("verdict").and_then(|x| x.as_str()),
+        Some("failed"),
+        "status reports verdict failed: {json}"
+    );
+    assert_eq!(
+        task.get("contracts")
+            .and_then(|c| c.as_array())
+            .map(|a| a.len()),
+        Some(0),
+        "no contracts on a failed gate: {json}"
+    );
+}
+
 /// A NON-verify (merge) task whose gate writes accept_report.json surfaces
 /// the per-contract verdicts on the MERGED receipt (the merge path reads the
 /// report before cleanup). spec: lifecycle/verify-tasks#accept-report-rides-merge

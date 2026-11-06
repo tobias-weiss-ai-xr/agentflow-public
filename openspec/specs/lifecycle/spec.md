@@ -185,6 +185,17 @@ GIVEN a `verify: true` task whose acceptance gate is the sole deliverable
 WHEN the gate exits 0, even if the agent committed nothing
 THEN the branch is archived as `<branch>-rejected-<now>` and never merged, and the receipt records `outcome: "verified"`.
 
+#### Scenario: verify task's acceptance report rides the receipt sorted by key
+
+GIVEN a `verify: true` task whose acceptance gate exits 0 and writes an `accept_report.json` with a per-contract verdict map
+THEN the per-contract verdicts are parsed best-effort onto the `verified` receipt's `contracts` field, sorted by contract key (a `BTreeMap` order), and a missing or unparsable report does not fail the attempt.
+
+#### Scenario: status --json surfaces the verify verdict and contracts
+
+GIVEN a `verify: true` task that reached `done` with `outcome: "verified"`
+WHEN `af status --json` is rendered
+THEN the task's object carries `verify: true`, `verdict: "verified"`, and the per-contract `contracts` array (sorted by contract key); a `verify: true` task that failed the gate surfaces `verify: true` with `verdict: "failed"` and an empty `contracts` array.
+
 #### Scenario: verify task gate fails
 
 GIVEN a `verify: true` task whose acceptance gate exits non-zero
