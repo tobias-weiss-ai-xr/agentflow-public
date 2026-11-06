@@ -2357,6 +2357,7 @@ fn reuse_writes_a_recovered_receipt() {
             error: Some("acceptance gate failed (exit 1): boom".into()),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         })
         .unwrap();
 

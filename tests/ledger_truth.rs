@@ -109,6 +109,7 @@ fn receipt(
         error: error.map(str::to_string),
         cost_micros: None,
         contracts: None,
+        failure_class: None,
     }
 }
 

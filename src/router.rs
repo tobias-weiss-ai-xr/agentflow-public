@@ -201,6 +201,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         }
     }
 
@@ -398,5 +399,55 @@ mod tests {
             "cheap",
             "the incumbent cheaper price stays"
         );
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#infra-failures-are-not-trust-verdicts
+    fn infra_failures_do_not_lower_router_trust() {
+        // Production (`run_loop`) filters receipts through
+        // `counts_as_verdict` before replaying them into the router. An
+        // infra-classified failure is not a verdict, so it never reaches the
+        // router: the worker keeps its untouched trust (fresh → None), NOT a
+        // lowered one (a lone failure would score 1/3).
+        let infra_fail = Receipt {
+            failure_class: Some("infra".into()),
+            ..receipt("w1", "failed")
+        };
+        let verdicts: Vec<Receipt> = [infra_fail]
+            .into_iter()
+            .filter(|r| r.counts_as_verdict())
+            .collect();
+        let r = Router::from_receipts(&verdicts);
+        assert_eq!(
+            r.trust("w1"),
+            None,
+            "an infra failure is filtered out before the router sees it"
+        );
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#agent-failures-remain-trust-verdicts
+    fn agent_failures_still_lower_router_trust() {
+        // The contrast: an AGENT-classified failure IS a verdict and must
+        // still move trust (a lone failure shows the raw rate 0.0, vs. a
+        // fresh worker's None).
+        let agent_fail = Receipt {
+            failure_class: Some("agent".into()),
+            ..receipt("w1", "failed")
+        };
+        let verdicts: Vec<Receipt> = [agent_fail]
+            .into_iter()
+            .filter(|r| r.counts_as_verdict())
+            .collect();
+        let r = Router::from_receipts(&verdicts);
+        assert_eq!(
+            r.trust("w1"),
+            Some(0.0),
+            "an agent failure lowers trust exactly as before"
+        );
+        // And the routing choice: the agent-failed worker's smoothed mean
+        // (1/3) loses to an untouched fresh worker (prior 0.5 + exploration).
+        let pool = [worker("w1"), worker("w2")];
+        assert_eq!(r.pick(pool.iter()).unwrap().name, "w2");
     }
 }

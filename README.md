@@ -522,6 +522,17 @@ score(worker) =  mean(worker)  +  sqrt( 2 * ln(N + 1) / (n + 1) )
 data stays measured; the smoothed version is the routing term only.)
 - `N` = total attempts across all workers; `n` = this worker's attempts.
 
+A **failure class** tells the router whose fault a failure was. Every failed
+receipt records `failure_class`: `"infra"` when the harness, transport or
+environment failed (provider error, timeout, stall watchdog, missing
+binary, git/io error, native-harness turn cap) and `"agent"` when the work
+itself was judged wrong (non-zero exit, gate failure, scope violation, zero
+commits). An `infra` failure is **not a verdict**: it never enters `WINS` or
+`TOTAL`, so a provider outage or a turn-cap death stops poisoning a worker's
+trust (it still burns one `max_attempts` retry and its tokens still count in
+`af cost`). An `agent` failure lowers trust exactly as before. `af status
+--json` surfaces each task's latest `failure_class` (`null` when none).
+
 A tie between equally scoring workers is broken in a fixed order: the cheaper
 DECLARED basis (`params_b` / `price_per_mtok_usd`) first, then the strictly
 faster measured mean wall-clock (`MEAN_S` in `af cost`, computed over verdict

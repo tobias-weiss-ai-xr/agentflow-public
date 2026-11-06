@@ -107,6 +107,41 @@ fn outcome_name(o: &Outcome) -> &'static str {
     }
 }
 
+/// Classify a failed attempt's reason into a failure class, so receipts can
+/// distinguish "the worker was wrong" (`agent`) from "the infrastructure
+/// failed" (`infra`). Every failure reason agentflow produces has a
+/// controlled prefix; the classification matches those signals. `Some("infra")`
+/// for a harness/transport/environment/budget wall (provider error, timeout,
+/// stall, missing binary, kill, git/io error, harness failure incl. turn cap);
+/// `Some("agent")` for everything else where the work itself was judged
+/// wrong or missing (non-zero exit, gate failure, scope violation, zero
+/// commits, merge verification failure). `None` for a non-failure (the
+/// caller passes only failed reasons).
+///
+/// This is the single source of truth: `execute_task` classifies the
+/// persisted receipt, and `reap` classifies the LIVE router update from the
+/// same reason string with the same function, so replay and runtime always
+/// agree.
+pub fn classify_failure(error: &str) -> &'static str {
+    let e = error.to_ascii_lowercase();
+    const INFRA: [&str; 8] = [
+        "harness",    // native harness failures incl. `turn cap`, provider error, `stop=Timeout`
+        "timeout",    // total agent timeout
+        "stall",      // stall watchdog
+        "missing",    // binary not found
+        "kill",       // killed by us / orchestration
+        "cannot",     // git/io errors: cannot write prompt, cannot commit, cannot compute diff
+        "provider",   // explicit provider errors
+        "connection", // transport
+    ];
+    for sig in INFRA {
+        if e.contains(sig) {
+            return "infra";
+        }
+    }
+    "agent"
+}
+
 pub fn execute_task(
     ctx: &ExecCtx,
     worker: &Worker,
@@ -120,6 +155,13 @@ pub fn execute_task(
     let outcome_name = outcome_name(&outcome);
     let error = match &outcome {
         Outcome::Failed(e) => Some(e.lines().next().unwrap_or("").chars().take(200).collect()),
+        Outcome::Merged | Outcome::Verified => None,
+    };
+    // Failure class (infra vs agent) from the FULL reason before truncation,
+    // so the receipt and the live router (`reap`) classify the same attempt
+    // identically (`classify_failure` is the single source of truth).
+    let failure_class = match &outcome {
+        Outcome::Failed(e) => Some(crate::execute::classify_failure(e).to_string()),
         Outcome::Merged | Outcome::Verified => None,
     };
     let _ = ctx.store.append_receipt(&Receipt {
@@ -137,6 +179,7 @@ pub fn execute_task(
         error,
         cost_micros: spend.cost_micros,
         contracts,
+        failure_class,
     });
     outcome
 }
@@ -1304,6 +1347,7 @@ mod tests {
             error: error.map(|e| e.into()),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         }
     }
 
@@ -1382,6 +1426,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            failure_class: None,
         }
     }
 
@@ -1431,6 +1476,42 @@ mod tests {
         assert_eq!(outcome_name(&Outcome::Verified), "verified");
         assert_eq!(outcome_name(&Outcome::Merged), "merged");
         assert_eq!(outcome_name(&Outcome::Failed("x".into())), "failed");
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#provider-signal-reasons-classify-as-infra
+    fn classify_failure_tags_infra_signals() {
+        let infra = [
+            "agent exited Timeout (code -)",
+            "agent stalled: produced no output for 30s (stall window, AF_AGENT_STALL_S=30); killed before agent_timeout_s=3600",
+            "agent exited Missing (code -)",
+            "agent exited Killed (code -)",
+            "harness: turn cap 12 reached",
+            "harness: HTTP 429 Too Many Requests",
+            "harness failed (ProviderError)",
+            "cannot write prompt: read-only file system",
+            "cannot commit the agent's uncommitted work: index.lock exists",
+            "cannot compute attempt diff (main...HEAD): fatal: bad revision",
+        ];
+        for e in infra {
+            assert_eq!(classify_failure(e), "infra", "expected infra for: {e}");
+        }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#work-judgement-reasons-classify-as-agent
+    fn classify_failure_tags_agent_signals() {
+        let agent = [
+            "agent exited NonZero (code 7)",
+            "gate failed (exit 1): test -f DONE.txt",
+            "scope violation: src/lib.rs outside scope [\"src/**\"]",
+            "zero commits: attempt branch carries no commits beyond main; use the wildcard for empty scope if intended",
+            "merge of tf/A-1-123 reported success but the base does not contain it",
+            "no change produced",
+        ];
+        for e in agent {
+            assert_eq!(classify_failure(e), "agent", "expected agent for: {e}");
+        }
     }
 
     #[test]

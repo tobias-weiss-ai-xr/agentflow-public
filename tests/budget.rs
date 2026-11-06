@@ -146,6 +146,7 @@ fn seed_receipt(st: &Settings, task: &str, wall_clock_s: f64) {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         })
         .unwrap();
 }
@@ -169,6 +170,7 @@ fn seed_receipt_with_tokens(st: &Settings, task: &str, wall_clock_s: f64, tokens
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         })
         .unwrap();
 }

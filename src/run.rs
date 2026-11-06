@@ -80,12 +80,20 @@ fn reap(
         // Every reaped attempt is a verdict (merged/failed) WITH its
         // measured wall-clock — the same span `execute_task` records on
         // the receipt — so the live duration stat matches a replay from
-        // receipts.
-        router.record(
-            &worker_name,
-            matches!(outcome, Outcome::Merged | Outcome::Verified),
-            Some(wall_s),
-        );
+        // receipts. EXCEPT a failure classified `infra` (provider, timeout,
+        // stall, missing binary, git/io, harness): it is not a verdict on
+        // the worker, so it must not move the trust stats — exactly as the
+        // startup replay excludes it via `counts_as_verdict`. The classifier
+        // runs on the same reason string `execute_task` classified, so both
+        // paths agree by construction.
+        let infra = matches!(&outcome, Outcome::Failed(e) if crate::execute::classify_failure(e) == "infra");
+        if !infra {
+            router.record(
+                &worker_name,
+                matches!(outcome, Outcome::Merged | Outcome::Verified),
+                Some(wall_s),
+            );
+        }
         // Journal reconciliation: attempt threads persist phase boundaries
         // via load-modify-save (see `record_phase`), so this in-memory map
         // has not seen them. Copy every entry's freshest persisted boundary
@@ -215,6 +223,7 @@ fn append_recovered_receipt(store: &Store, st: &Settings, task_id: &str, branch:
         error: None,
         cost_micros: None,
         contracts: None,
+        failure_class: None,
     });
 }
 
@@ -1116,6 +1125,7 @@ fn finish_resume_verify(
         error: None,
         cost_micros: None,
         contracts: None,
+        failure_class: None,
     });
     true
 }
@@ -1359,6 +1369,7 @@ fn heal_stale_attempt(
             error: Some(error),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         });
         // RerunAgent, or a resume that lost its artifacts (always safe):
         // apply the budget to the now-counted attempt — Ready for a fresh
@@ -1777,6 +1788,16 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Failure class of the latest FAILED receipt for this task (the
+        // most recent `failed`/`infra` attempt), surfaced so an operator can
+        // see whether the last failure was the worker's (`agent`) or the
+        // infrastructure's (`infra`). `None` when the task has no failed
+        // receipt.
+        let failure_class = receipts
+            .iter()
+            .rev()
+            .find(|r| r.task == t.id && r.outcome == "failed")
+            .and_then(|r| r.failure_class.clone());
         map.insert(
             t.id.clone(),
             serde_json::json!({
@@ -1787,6 +1808,7 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
                 "verify": t.verify,
                 "verdict": verdict,
                 "contracts": contracts,
+                "failure_class": failure_class,
             }),
         );
     }
@@ -2982,6 +3004,7 @@ mod tests {
                     contract: "C-M1".into(),
                     verdict: "pass".into(),
                 }]),
+                failure_class: None,
             })
             .unwrap();
 
@@ -3004,7 +3027,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // --- startup heal / resume --------------------------------------------
+    #[test]
+    // spec: state/failure-class-on-receipts#status-json-surfaces-the-failure-class
+    fn status_json_surfaces_the_latest_failure_class() {
+        let base = unique_base("status-fc");
+        let st = settings(base.clone());
+        let cfg = cfg_with(vec![task("A"), task("B")]);
+        let mut status = HashMap::new();
+        status.insert(
+            "A".into(),
+            TaskStatus {
+                state: TaskState::Failed,
+                attempts: 1,
+                last_error: Some("harness: HTTP 429".into()),
+                ..Default::default()
+            },
+        );
+        Store::new(st.state_dir.clone()).save(&status).unwrap();
+        let store = Store::new(st.state_dir.clone());
+        store
+            .append_receipt(&Receipt {
+                task: "A".into(),
+                attempt: 1,
+                worker: "w1".into(),
+                model: "m".into(),
+                wall_clock_s: 1.0,
+                tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                ts: 1,
+                outcome: "failed".into(),
+                error: Some("harness: HTTP 429".into()),
+                cost_micros: None,
+                contracts: None,
+                failure_class: Some("infra".into()),
+            })
+            .unwrap();
+
+        let out = status_json(&cfg, &st);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("status_json is valid JSON");
+        assert_eq!(
+            v["A"]["failure_class"], "infra",
+            "most recent failed receipt's class surfaces"
+        );
+        assert!(
+            v["B"]["failure_class"].is_null(),
+            "no failed receipt for B → null"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn heal_stale_attempt_reruns_unproven_agents_from_ready() {
@@ -3250,6 +3323,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         store.append_receipt(&receipt("A", 10.0, "merged")).unwrap();
         store.append_receipt(&receipt("A", 5.5, "failed")).unwrap();
@@ -3299,6 +3373,7 @@ mod tests {
             error: error.map(str::to_string),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         // No error on the receipt → the literal key.
         assert_eq!(waste_cause(&r(None)), "unknown");
@@ -3398,6 +3473,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
+                failure_class: None,
             };
         // A: a failed retry then a merge on another worker. B: a same-ts
         // tie between attempts 1/2 — the greater attempt must win. C: two
@@ -3515,6 +3591,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         store
             .append_receipt(&rcpt(1, 1_600_000_000, 100.0, "w1", "failed"))
@@ -3599,6 +3676,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         // The mean over the verdict attempts, one decimal.
         let merged = rcpt(2.0, "merged");
@@ -3677,6 +3755,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         // Every attempt Priced: the dollars SUM (500k + 250k at $2/Mtok).
         let r1 = rcpt("pw", Some(500_000));
@@ -3769,6 +3848,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
+            failure_class: None,
         };
         // One measured + one price-estimated attempt → named source plus
         // the estimate count, exactly the shape the report prints.
@@ -3825,6 +3905,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
+            failure_class: None,
         };
         // Measured beats declared: 500k tokens at $2/Mtok would estimate to
         // $1.0000, but the provider reported $0.0123 — the measurement wins

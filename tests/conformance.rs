@@ -59,6 +59,7 @@ fn receipt(task: &str, attempt: u32, ts: u64) -> Receipt {
         error: None,
         cost_micros: None,
         contracts: None,
+        failure_class: None,
     }
 }
 
@@ -247,6 +248,7 @@ fn receipts_roundtrip_turns_and_default_none_for_legacy() {
             error: Some("harness: turn cap 96 reached".into()),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         })
         .unwrap();
     let loaded = Store::new(dir.clone()).load_receipts();

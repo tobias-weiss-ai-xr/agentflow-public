@@ -145,6 +145,21 @@ pub struct Receipt {
     /// (verify AND merged tasks). `None` when no report was present/parseable.
     #[serde(default)]
     pub contracts: Option<Vec<ContractVerdict>>,
+    /// Failure class when the attempt FAILED: `"infra"` (a harness,
+    /// transport, or environment problem — provider error, timeout, stall,
+    /// missing binary, git/io error, harness budget wall — that is NOT a
+    /// verdict on this worker's reliability) or `"agent"` (the agent's work
+    /// itself was wrong: non-zero exit, gate failure, scope violation, no
+    /// change). `None` for non-failed receipts (merged/verified),
+    /// `interrupted`/`recovered` bookkeeping receipts, and legacy receipts.
+    /// Trust statistics SHALL exclude `"infra"` receipts from the numerator
+    /// AND the denominator ([`Receipt::counts_as_verdict`]) — the worker did
+    /// not fail, the infrastructure did. An infra failure still counts
+    /// toward the task's `attempts` / `max_attempts` retry budget (an
+    /// attempt genuinely happened) and toward cost totals (the tokens were
+    /// spent); only the trust statistic ignores it.
+    #[serde(default)]
+    pub failure_class: Option<String>,
 }
 
 /// Outcome recorded for an attempt lost because the orchestrator itself died
@@ -165,10 +180,15 @@ impl Receipt {
     /// excluded because the attempt was lost when the orchestrator itself
     /// died (no agent result, no gate result); [`OUTCOME_RECOVERED`] is
     /// excluded because no agent ran at all — recovery re-validates and
-    /// merges work that was already paid for. Every trust statistic must
-    /// exclude both from the numerator AND the denominator.
+    /// merges work that was already paid for. A `failed` attempt whose
+    /// [`failure_class`](Self::failure_class) is `"infra"` is also excluded:
+    /// the infrastructure (provider, transport, harness, git/io) failed, not
+    /// the worker, so it must never lower the worker's trust. Every trust
+    /// statistic must exclude all of these from the numerator AND the
+    /// denominator.
     pub fn counts_as_verdict(&self) -> bool {
-        self.outcome == "merged" || self.outcome == "failed" || self.outcome == "verified"
+        (self.outcome == "merged" || self.outcome == "failed" || self.outcome == "verified")
+            && self.failure_class.as_deref() != Some("infra")
     }
 
     /// Whether this receipt represents a successful outcome (a verdict).
@@ -620,6 +640,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
+                failure_class: None,
             })
             .unwrap();
         store
@@ -638,6 +659,7 @@ mod tests {
                 error: Some("agent exited 7".into()),
                 cost_micros: None,
                 contracts: None,
+                failure_class: None,
             })
             .unwrap();
         let rs = store.load_receipts();
@@ -665,6 +687,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         assert!(r.counts_as_verdict(), "verified must count as a verdict");
     }
@@ -687,6 +710,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
+                failure_class: None,
             };
             assert!(r.is_success(), "{outcome} must count as a success");
         }
@@ -705,6 +729,7 @@ mod tests {
             error: Some("boom".into()),
             cost_micros: None,
             contracts: None,
+            failure_class: None,
         };
         assert!(!failed.is_success(), "failed must NOT count as a success");
     }
@@ -719,5 +744,69 @@ mod tests {
         assert_eq!(s, r#"{"contract":"C-M1","verdict":"pass"}"#);
         let back: ContractVerdict = serde_json::from_str(&s).unwrap();
         assert_eq!(back, cv);
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#infra-failures-are-not-trust-verdicts
+    fn infra_failed_receipt_is_not_a_verdict() {
+        for cls in ["infra", "agent"] {
+            let mut r = Receipt {
+                task: "A".into(),
+                attempt: 1,
+                worker: "w1".into(),
+                model: "m".into(),
+                wall_clock_s: 1.0,
+                tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                ts: 0,
+                outcome: "failed".into(),
+                error: Some("x".into()),
+                cost_micros: None,
+                contracts: None,
+                failure_class: Some(cls.into()),
+            };
+            if cls == "infra" {
+                assert!(
+                    !r.counts_as_verdict(),
+                    "an infra failure is NOT a verdict on the worker"
+                );
+            } else {
+                assert!(
+                    r.counts_as_verdict(),
+                    "an agent failure IS a verdict on the worker"
+                );
+            }
+            // A merged receipt never has a failure class; nothing breaks.
+            r.outcome = "merged".into();
+            r.failure_class = None;
+            assert!(r.counts_as_verdict());
+        }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#legacy-failed-receipts-stay-verdicts
+    fn legacy_failed_receipt_without_failure_class_is_a_verdict() {
+        let r = Receipt {
+            task: "A".into(),
+            attempt: 1,
+            worker: "w1".into(),
+            model: "m".into(),
+            wall_clock_s: 1.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: "failed".into(),
+            error: Some("agent exited NonZero (code 7)".into()),
+            cost_micros: None,
+            contracts: None,
+            failure_class: None,
+        };
+        // Backward compatible: a pre-failure-class receipt deserializes with
+        // failure_class None and still counts as a verdict (today's behavior).
+        assert!(r.counts_as_verdict());
     }
 }
