@@ -157,6 +157,51 @@ pub fn pick_worker<'a>(
     router.pick(eligible)
 }
 
+/// Cascade (escalation) routing: the worker for a task's attempt under a
+/// declared `cascade`, when one applies. `attempt` is 1-based; the cascade
+/// is CHEAPEST-FIRST, so attempt N tries `cascade[N-1]`. Returns `None` when
+/// the task has no cascade, the attempt is past the cascade, the named
+/// worker is disabled, or it is busy with another task — the caller then
+/// falls back to UCB1 exactly as today. The gate remains the sole arbiter:
+/// this only changes WHO is dispatched, never whether work is accepted.
+fn cascade_worker<'a>(
+    cfg: &'a Config,
+    task: &crate::config::Task,
+    attempt: u32,
+    busy: &Mutex<HashMap<String, bool>>,
+) -> Option<&'a crate::config::Worker> {
+    let cascade = task.cascade.as_ref()?;
+    if attempt == 0 {
+        return None;
+    }
+    let idx = (attempt - 1) as usize;
+    let name = cascade.get(idx)?;
+    let busy = busy.lock().unwrap();
+    cfg.workers
+        .iter()
+        .find(|w| w.name == *name && w.enabled && !busy.get(&w.name).copied().unwrap_or(false))
+}
+
+/// The worker for a task's next attempt: the cascade worker when one
+/// applies (task has a `cascade` and no explicit `--worker` filter), else
+/// the UCB1 pick. An explicit filter overrides the cascade — the operator's
+/// pin is a stronger constraint than the task's escalation intent.
+pub fn pick_for_attempt<'a>(
+    cfg: &'a Config,
+    task: &crate::config::Task,
+    attempt: u32,
+    busy: &Mutex<HashMap<String, bool>>,
+    router: &Router,
+    filter: Option<&str>,
+) -> Option<&'a crate::config::Worker> {
+    if filter.is_none() {
+        if let Some(w) = cascade_worker(cfg, task, attempt, busy) {
+            return Some(w);
+        }
+    }
+    pick_worker(cfg, busy, router, filter)
+}
+
 /// Operator escape hatch for pre-dispatch reuse: `AF_NO_REUSE=1` (also
 /// accepts `true`/`yes`) makes `af run` buy fresh agent work even when a
 /// scope-compatible archived branch exists, for an operator who wants a
@@ -840,11 +885,29 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                         }
                     }
                 }
-                let worker =
-                    match pick_worker(&cfg, &worker_busy, &router, opts.worker_filter.as_deref()) {
-                        Some(w) => w.clone(),
-                        None => break, // no free worker this round
-                    };
+                // Cascade (escalation) routing: a task with a `cascade` runs
+                // the CHEAPEST worker first (attempt 1 = cascade[0]) and
+                // escalates to the next on each retry, so a hard task pays
+                // only the escalation it needs. The gate stays the sole
+                // arbiter — a cascade only changes WHO is dispatched.
+                // `pick_for_attempt` consults the cascade (skipped when an
+                // explicit `--worker` filter is set) and falls back to UCB1
+                // when the attempt is past the cascade, the cascade worker
+                // is disabled, or it is busy. The attempt number is read
+                // from persisted status (next attempt = attempts + 1)
+                // BEFORE worker selection.
+                let next_attempt = status.get(&t.id).map(|s| s.attempts).unwrap_or(0) + 1;
+                let worker = match pick_for_attempt(
+                    &cfg,
+                    &t,
+                    next_attempt,
+                    &worker_busy,
+                    &router,
+                    opts.worker_filter.as_deref(),
+                ) {
+                    Some(w) => w.clone(),
+                    None => break, // no free worker this round
+                };
                 // Mark Running + persist BEFORE spawning (crash-safety).
                 let attempt = {
                     let s = status.entry(t.id.clone()).or_default();
@@ -4101,6 +4164,110 @@ mod tests {
         assert!(
             st.state_dir.join("stop").exists(),
             "stop wish is recorded even without a live orchestrator"
+        );
+    }
+
+    // --- cascade (escalation) routing -------------------------------------
+
+    fn busy_with(names: &[&str]) -> std::sync::Mutex<HashMap<String, bool>> {
+        let mut m = HashMap::new();
+        for n in names {
+            m.insert(n.to_string(), true);
+        }
+        std::sync::Mutex::new(m)
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#first-attempt-runs-the-cheapest-cascade-worker
+    // spec: scheduling/cascade-escalation-routing#a-failed-attempt-escalates-to-the-next-worker
+    // spec: scheduling/cascade-escalation-routing#past-the-cascade-the-router-picks-again
+    // spec: scheduling/cascade-escalation-routing#a-task-without-a-cascade-keeps-ucb1
+    fn cascade_picks_cheapest_first_and_escalates_by_attempt() {
+        let cfg = cfg_with_workers(
+            vec![],
+            vec![
+                worker_named("cheap"),
+                worker_named("pro"),
+                worker_named("opus"),
+            ],
+        );
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into(), "pro".into(), "opus".into()]);
+        let idle = std::sync::Mutex::new(HashMap::new());
+        let router = Router::default();
+
+        // Attempt 1 → cheap; attempt 2 → pro; attempt 3 → opus.
+        fn wname(w: Option<&crate::config::Worker>) -> Option<String> {
+            w.map(|w| w.name.clone())
+        }
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 1, &idle)),
+            Some("cheap".to_string())
+        );
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 2, &idle)),
+            Some("pro".to_string())
+        );
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 3, &idle)),
+            Some("opus".to_string())
+        );
+        // Past the cascade → None (caller falls back to UCB1).
+        assert!(cascade_worker(&cfg, &t, 4, &idle).is_none());
+        // No cascade → None.
+        let no_cascade = task("B");
+        assert!(cascade_worker(&cfg, &no_cascade, 1, &idle).is_none());
+        // The end-to-end decision (`pick_for_attempt`) indexes the cascade
+        // by attempt, and a task without a cascade goes straight to UCB1.
+        assert_eq!(
+            wname(pick_for_attempt(&cfg, &t, 2, &idle, &router, None)),
+            Some("pro".to_string())
+        );
+        assert_eq!(
+            wname(pick_for_attempt(&cfg, &no_cascade, 1, &idle, &router, None)),
+            Some("cheap".to_string()),
+            "no cascade → first configured worker via UCB1"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#an-explicit-worker-pin-overrides-the-cascade
+    fn worker_filter_overrides_the_cascade() {
+        let cfg = cfg_with_workers(vec![], vec![worker_named("cheap"), worker_named("pro")]);
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into()]);
+        let idle = std::sync::Mutex::new(HashMap::new());
+        let router = Router::default();
+        let w = pick_for_attempt(&cfg, &t, 1, &idle, &router, Some("pro"));
+        assert_eq!(
+            w.unwrap().name,
+            "pro",
+            "the pinned worker wins over the cascade"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#a-busy-or-disabled-cascade-worker-falls-back-to-ucb1
+    fn cascade_falls_back_when_worker_busy_or_disabled() {
+        let mut cheap = worker_named("cheap");
+        cheap.enabled = false;
+        let cfg = cfg_with_workers(vec![], vec![cheap, worker_named("pro")]);
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into(), "pro".into()]);
+
+        // Disabled first rung → None → UCB1 fallback.
+        assert!(cascade_worker(&cfg, &t, 1, &busy_with(&[])).is_none());
+        // Busy first rung → None (the caller falls back rather than stall).
+        let busy = busy_with(&["cheap"]);
+        let cfg2 = cfg_with_workers(vec![], vec![worker_named("cheap"), worker_named("pro")]);
+        assert!(cascade_worker(&cfg2, &t, 1, &busy).is_none());
+        // Second rung engaged and idle is picked.
+        fn wname(w: Option<&crate::config::Worker>) -> Option<String> {
+            w.map(|w| w.name.clone())
+        }
+        assert_eq!(
+            wname(cascade_worker(&cfg2, &t, 2, &busy)),
+            Some("pro".to_string())
         );
     }
 }

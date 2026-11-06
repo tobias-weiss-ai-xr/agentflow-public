@@ -342,6 +342,7 @@ to block the command: the readable history is still accounted for.
 | `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 Often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
 | `max_tokens` | Per-task token ceiling (default `0`/absent = no cap): before each dispatch af sums this task's receipts and, at/above the cap, marks the task `failed` with a reason naming the spend and the cap — no further agent runs for it. Composes with `AF_MAX_TOKENS`, `max_turns` and `max_attempts`. |
 | `readonly` | `true` = investigation-only: the builtin harness rejects `write`/`edit`, the attempt counts done on a normal agent stop (no gate, no merge) |
+| `cascade` | Ordered list of worker names tried CHEAPEST-FIRST across attempts: attempt 1 runs `cascade[0]`, attempt 2 escalates to `cascade[1]`, and so on — a hard task pays only the escalation it needs. When the attempt is past the cascade, the worker is busy, or it is disabled, af falls back to normal UCB1 routing. An explicit `--worker` pin overrides the cascade. The acceptance gate stays the sole arbiter (a cascade only changes WHO is dispatched). Validation rejects unknown worker names, duplicates, and an empty array. |
 | `verify` | `true` = verification task: the acceptance gate is the sole deliverable; the branch is archived (never merged) and the receipt records `verified`. Rejected with `manual`, `readonly`, or no `accept` gate. |
 
 Replay contract: the `accept` command MUST be idempotent; declare
@@ -532,6 +533,16 @@ commits). An `infra` failure is **not a verdict**: it never enters `WINS` or
 trust (it still burns one `max_attempts` retry and its tokens still count in
 `af cost`). An `agent` failure lowers trust exactly as before. `af status
 --json` surfaces each task's latest `failure_class` (`null` when none).
+
+**Cascade (escalation) routing** is the per-task counterweight to the global
+router: a task may declare `cascade: ["cheap", "pro"]` to start the
+cheapest worker and escalate to the next on each retry, so a hard task pays
+only the escalation the gate demands. Attempt 1 runs `cascade[0]`, attempt 2
+runs `cascade[1]`, and so on; past the cascade — or when the rung is busy or
+disabled — routing falls back to UCB1 exactly as without a cascade. An
+`--worker` pin overrides the cascade. The acceptance gate stays the sole
+arbiter: a cascade only changes WHO is dispatched, never whether work is
+accepted.
 
 A tie between equally scoring workers is broken in a fixed order: the cheaper
 DECLARED basis (`params_b` / `price_per_mtok_usd`) first, then the strictly

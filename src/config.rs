@@ -130,6 +130,19 @@ pub struct Task {
     /// `readonly`, or a missing `accept` gate. Default `false`.
     #[serde(default)]
     pub verify: bool,
+    /// Cost-first escalation chain (cascade routing): an ordered list of
+    /// worker names tried CHEAPEST-FIRST across a task's attempts — attempt
+    /// 1 runs `cascade[0]`, attempt 2 runs `cascade[1]`, and so on — so the
+    /// cheapest capable worker gets the first shot and a harder/failing
+    /// task escalates to the next worker on retry. The gate stays the sole
+    /// arbiter: a cascade only changes WHO is dispatched, never whether
+    /// work is accepted. When the attempt index is past the cascade, the
+    /// named worker is disabled, or it is busy, the router falls back to
+    /// UCB1 exactly as today. Validation SHALL reject a cascade entry that
+    /// names no worker in `workers.json`, duplicate entries, and an empty
+    /// array (treat as absent). Absent = no cascade (UCB1 as today).
+    #[serde(default)]
+    pub cascade: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +425,49 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
                 "task '{}': no acceptance gate and not manual — gate will be skipped",
                 t.id
             ));
+        }
+        // Cascade (escalation) routing: every entry must name a real worker,
+        // entries must be unique, and an empty array is a no-op (treat as
+        // absent). A cascade that names a missing worker would silently
+        // dispatch the wrong (UCB1) worker on escalation — the operator
+        // declared an intent the config cannot honor, so it is a hard error.
+        if let Some(c) = &t.cascade {
+            if c.is_empty() {
+                return Err(format!(
+                    "task '{}': cascade is an empty array — omit it instead",
+                    t.id
+                ));
+            }
+            let mut seen_w: HashSet<&str> = HashSet::new();
+            for name in c {
+                if name.is_empty() {
+                    return Err(format!(
+                        "task '{}': cascade contains an empty worker name",
+                        t.id
+                    ));
+                }
+                if !seen_w.insert(name.as_str()) {
+                    return Err(format!(
+                        "task '{}': cascade lists worker '{}' more than once (escalation would repeat it)",
+                        t.id, name
+                    ));
+                }
+                if !workers.iter().any(|w| w.name == *name) {
+                    return Err(format!(
+                        "task '{}': cascade names worker '{}' which is not in workers.json",
+                        t.id, name
+                    ));
+                }
+            }
+            if let Some(first) = c.first() {
+                let enabled = workers.iter().any(|w| w.name == *first && w.enabled);
+                if !enabled {
+                    warnings.push(format!(
+                        "task '{}': cascade starts with '{}' but that worker is disabled — every attempt will fall back to UCB1",
+                        t.id, first
+                    ));
+                }
+            }
         }
     }
 
@@ -1374,5 +1430,86 @@ mod repo_tests {
         let w = cfg.repo_warnings(&default);
         assert_eq!(w.len(), 1, "only 'docs' warns: {w:?}");
         assert!(w[0].contains("task 'c'") && w[0].contains("docs"));
+    }
+
+    fn cascade_task(id: &str) -> Task {
+        Task {
+            id: id.into(),
+            cascade: Some(vec!["cheap".into(), "pro".into()]),
+            ..Default::default()
+        }
+    }
+
+    fn named_worker(name: &str) -> Worker {
+        Worker {
+            name: name.into(),
+            provider: "openai".into(),
+            model: format!("model-{name}"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cascade_validation_accepts_matching_workers() {
+        let tasks = vec![cascade_task("T1")];
+        let workers = vec![named_worker("cheap"), named_worker("pro")];
+        let warnings = validate(&tasks, &workers).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("cascade")),
+            "no cascade warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    // spec: config/per-task-turn-cap-and-readonly-task-fields#cascade-must-name-real-workers
+    fn cascade_validation_rejects_unknown_worker() {
+        let tasks = vec![cascade_task("T1")];
+        let err = validate(&tasks, &[named_worker("cheap")]).unwrap_err();
+        assert!(
+            err.contains("cascade names worker 'pro'") && err.contains("not in workers.json"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    // spec: config/per-task-turn-cap-and-readonly-task-fields#cascade-entries-must-be-unique
+    fn cascade_validation_rejects_duplicate_entries() {
+        let mut t = cascade_task("T1");
+        t.cascade = Some(vec!["cheap".into(), "cheap".into()]);
+        let err = validate(&[t], &[named_worker("cheap"), named_worker("pro")]).unwrap_err();
+        assert!(
+            err.contains("cascade lists worker 'cheap' more than once"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    // spec: config/per-task-turn-cap-and-readonly-task-fields#empty-cascade-is-rejected
+    fn cascade_validation_rejects_empty_array() {
+        let t = Task {
+            id: "T1".into(),
+            cascade: Some(vec![]),
+            ..Default::default()
+        };
+        let err = validate(&[t], &[]).unwrap_err();
+        assert!(
+            err.contains("cascade is an empty array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cascade_validation_ignores_disabled_first_rung() {
+        let mut cheap = named_worker("cheap");
+        cheap.enabled = false;
+        let tasks = vec![cascade_task("T1")];
+        let workers = vec![cheap, named_worker("pro")];
+        let warnings = validate(&tasks, &workers).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("cascade starts with 'cheap'") && w.contains("disabled")),
+            "warning expected: {warnings:?}"
+        );
     }
 }

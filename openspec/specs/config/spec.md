@@ -207,6 +207,13 @@ above.
   SHALL be dispatched for it. It composes with the campaign ceiling
   (`AF_MAX_TOKENS`) and with `max_turns`/`max_attempts`. Absent or `0` =
   no per-task cap.
+- `cascade` — an optional ordered list of worker names (escalation chain,
+  cheapest first). Attempt `N` of the task dispatches on `cascade[N-1]`;
+  when the worker is busy, disabled, or the attempt is past the cascade, the
+  router falls back to UCB1. Validation SHALL reject with a hard error
+  naming the task: a cascade entry naming no worker in `workers.json`, a
+  duplicated worker within one cascade, and an empty cascade array. Absent
+  = UCB1 as before.
 
 #### Scenario: per-task max_turns parses and validates
 
@@ -226,6 +233,21 @@ THEN it loads with no per-task cap (`None`).
 
 WHEN a task declares `max_tokens: 0`
 THEN it loads with no per-task cap (0 is a no-op).
+
+#### Scenario: cascade must name real workers
+
+WHEN a task declares a `cascade` entry that names no worker in `workers.json`
+THEN loading fails naming the task and the worker.
+
+#### Scenario: cascade entries must be unique
+
+WHEN a task's `cascade` lists the same worker more than once
+THEN loading fails naming the task and the repeated worker.
+
+#### Scenario: empty cascade is rejected
+
+WHEN a task declares `cascade: []`
+THEN loading fails naming the task (an empty array is a config bug — omit it instead).
 
 ### Requirement: Gate/scope mismatch warning at validate time
 
