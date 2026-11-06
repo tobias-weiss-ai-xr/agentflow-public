@@ -116,6 +116,7 @@ fn fixture(tasks_json: &str, workers_json: &str, tag: &str) -> Fixture {
         agent_timeout_s: 60,
         agent_stall_s: 0,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     Fixture { dir, repo, cfg, st }

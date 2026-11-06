@@ -97,6 +97,7 @@ fn fixture(
         agent_timeout_s,
         agent_stall_s,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     Fixture { dir, repo, cfg, st }

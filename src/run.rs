@@ -83,22 +83,24 @@ fn reap(
                 wb.remove(&worker_name);
             }
         }
-        // Every reaped attempt that is a WORKER VERDICT (merged/failed/verified)
-        // is recorded WITH its measured wall-clock — the same span `execute_task`
-        // records on the receipt — so the live duration stat matches a replay
-        // from receipts. Infra failures (provider/transport outages) are
-        // excluded: `counts_as_verdict()` is false for `OUTCOME_INFRA`, so an
-        // outage never dents the worker's UCB1 trust (nor counts in the
-        // denominator).
-        if !matches!(outcome, Outcome::Infra(_)) {
+        drop(wb);
+        // Every reaped attempt is a verdict (merged/failed) WITH its
+        // measured wall-clock — the same span `execute_task` records on
+        // the receipt — so the live duration stat matches a replay from
+        // receipts. EXCEPT a failure classified `infra` (provider, timeout,
+        // stall, missing binary, git/io, harness): it is not a verdict on
+        // the worker, so it must not move the trust stats — exactly as the
+        // startup replay excludes it via `counts_as_verdict`. The classifier
+        // runs on the same reason string `execute_task` classified, so both
+        // paths agree by construction.
+        let infra = matches!(&outcome, Outcome::Failed(e) if crate::execute::classify_failure(e) == "infra");
+        if !infra {
             router.record(
                 &worker_name,
                 matches!(outcome, Outcome::Merged | Outcome::Verified),
                 Some(wall_s),
             );
         } else {
-            // Backoff: infra failure (provider/transport) → skip this worker
-            // for 30s to let the proxy recover.
             worker_backoff.lock().unwrap().insert(
                 worker_name.clone(),
                 std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -128,7 +130,7 @@ fn reap(
                 s.last_error = None;
                 println!("  ✓ {id} verified (attempt {})", s.attempts);
             }
-            Outcome::Failed(err) | Outcome::Infra(err) => {
+            Outcome::Failed(err) => {
                 s.last_error = Some(err.clone());
                 if s.attempts >= max_attempts {
                     s.state = TaskState::Failed;
@@ -173,12 +175,55 @@ pub fn pick_worker<'a>(
             };
             busy.get(&w.name).copied().unwrap_or(0) < cap
         })
-        .filter(|w| {
-            // Backoff: skip workers that recently had an infra failure.
-            !matches!(backoff.get(&w.name), Some(until) if *until > now)
-        })
+        .filter(|w| !matches!(backoff.get(&w.name), Some(until) if *until > now))
         .collect();
     router.pick(eligible)
+}
+
+/// Cascade (escalation) routing: the worker for a task's attempt under a
+/// declared `cascade`, when one applies. `attempt` is 1-based; the cascade
+/// is CHEAPEST-FIRST, so attempt N tries `cascade[N-1]`. Returns `None` when
+/// the task has no cascade, the attempt is past the cascade, the named
+/// worker is disabled, or it is busy with another task — the caller then
+/// falls back to UCB1 exactly as today. The gate remains the sole arbiter:
+/// this only changes WHO is dispatched, never whether work is accepted.
+fn cascade_worker<'a>(
+    cfg: &'a Config,
+    task: &crate::config::Task,
+    attempt: u32,
+    busy: &Mutex<HashMap<String, usize>>,
+) -> Option<&'a crate::config::Worker> {
+    let cascade = task.cascade.as_ref()?;
+    if attempt == 0 {
+        return None;
+    }
+    let idx = (attempt - 1) as usize;
+    let name = cascade.get(idx)?;
+    let busy = busy.lock().unwrap();
+    cfg.workers
+        .iter()
+        .find(|w| w.name == *name && w.enabled && busy.get(&w.name).copied().unwrap_or(0) == 0)
+}
+
+/// The worker for a task's next attempt: the cascade worker when one
+/// applies (task has a `cascade` and no explicit `--worker` filter), else
+/// the UCB1 pick. An explicit filter overrides the cascade — the operator's
+/// pin is a stronger constraint than the task's escalation intent.
+pub fn pick_for_attempt<'a>(
+    cfg: &'a Config,
+    task: &crate::config::Task,
+    attempt: u32,
+    busy: &Mutex<HashMap<String, usize>>,
+    backoff: &Mutex<HashMap<String, std::time::Instant>>,
+    router: &Router,
+    filter: Option<&str>,
+) -> Option<&'a crate::config::Worker> {
+    if filter.is_none() {
+        if let Some(w) = cascade_worker(cfg, task, attempt, busy) {
+            return Some(w);
+        }
+    }
+    pick_worker(cfg, busy, backoff, router, filter)
 }
 
 /// Operator escape hatch for pre-dispatch reuse: `AF_NO_REUSE=1` (also
@@ -247,7 +292,7 @@ fn append_recovered_receipt(store: &Store, st: &Settings, task_id: &str, branch:
         error: None,
         cost_micros: None,
         contracts: None,
-        kind: None,
+        failure_class: None,
     });
 }
 
@@ -670,9 +715,11 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
     let mut router = Router::from_receipts(&verdicts);
     // Performance cache: avoid re-reading receipts on every loop iteration.
     // The receipts only change when a new attempt completes (handled by reap),
-    // so we update `all_receipts_cache` and `measured_cache` there.
+    // so we update `all_receipts_cache`, `measured_cache` (wall-clock), and
+    // `tokens_cache` (token spend) there.
     let mut all_receipts_cache = all_receipts;
     let mut measured_cache = consumed_wall_clock_s(&all_receipts_cache, &in_scope);
+    let mut tokens_cache = consumed_tokens(&all_receipts_cache, &in_scope);
     loop {
         // Reap finished tasks — BLOCKING while attempts are in flight, so
         // a completion wakes the dispatcher immediately instead of it
@@ -709,6 +756,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
         if all_receipts_fresh.len() != receipt_count_before {
             all_receipts_cache = all_receipts_fresh;
             measured_cache = consumed_wall_clock_s(&all_receipts_cache, &in_scope);
+            tokens_cache = consumed_tokens(&all_receipts_cache, &in_scope);
         }
 
         // Hot-reload (feedback §6.2): plan this round against the CURRENT
@@ -747,15 +795,17 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
             println!("{}", board_of(&cfg, &status));
             return 0;
         }
-        // Cost ceiling (r8-budget-cap): use cached receipts for performance.
-        // Updated incrementally by reap() when new receipts are appended.
-        // 0 disables the ceiling entirely — the legacy behaviour.
+        // Cost ceilings (r8-budget-cap + token-budget-ceiling): use cached
+        // receipts for performance. Updated incrementally by reap() when new
+        // receipts are appended. 0 disables either ceiling entirely.
         let measured = if st.max_wall_clock_s == 0 {
             0.0
         } else {
             measured_cache
         };
-        let over_budget = wall_clock_budget_exhausted(st, measured);
+        let measured_tokens = if st.max_tokens == 0 { 0 } else { tokens_cache };
+        let over_budget = wall_clock_budget_exhausted(st, measured)
+            || token_budget_exhausted(st, measured_tokens);
 
         let running_ids: Vec<String> = running.lock().unwrap().keys().cloned().collect();
         if running_ids.is_empty() {
@@ -780,10 +830,17 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                         )
                     })
                     .count();
-                eprintln!(
-                    "wall-clock budget exhausted: spent {measured:.1}s of {}s cap; {not_started} in-scope task(s) not started",
-                    st.max_wall_clock_s
-                );
+                if token_budget_exhausted(st, measured_tokens) {
+                    eprintln!(
+                        "token budget exhausted: spent {measured_tokens} of {} tokens cap; {not_started} in-scope task(s) not started",
+                        st.max_tokens
+                    );
+                } else {
+                    eprintln!(
+                        "wall-clock budget exhausted: spent {measured:.1}s of {}s cap; {not_started} in-scope task(s) not started",
+                        st.max_wall_clock_s
+                    );
+                }
                 return 3;
             }
             if ready_in_scope == 0 {
@@ -831,8 +888,46 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                 {
                     continue;
                 }
-                let worker = match pick_worker(
+                // Per-task token ceiling: a task whose receipts already total
+                // at least its `max_tokens` is not dispatched — it is set to
+                // `failed` with a reason, exactly as `max_attempts` exhausts
+                // a task. 0 or absent = no per-task cap. This is a dispatch
+                // gate, not a mid-attempt kill (the provider reports usage
+                // after the round-trip). Composes with the campaign ceiling.
+                if let Some(cap) = t.max_tokens {
+                    if cap > 0 {
+                        let spent = consumed_tokens_for_task(&all_receipts_cache, &t.id);
+                        if spent >= cap {
+                            let s = status.entry(t.id.clone()).or_default();
+                            s.state = TaskState::Failed;
+                            s.last_error = Some(format!(
+                                "token budget exhausted: spent {spent} of {cap} max_tokens"
+                            ));
+                            let _ = store.save(&status);
+                            eprintln!(
+                                "  \u{2298} {} token budget exhausted: {spent}/{cap} tokens",
+                                t.id
+                            );
+                            continue;
+                        }
+                    }
+                }
+                // Cascade (escalation) routing: a task with a `cascade` runs
+                // the CHEAPEST worker first (attempt 1 = cascade[0]) and
+                // escalates to the next on each retry, so a hard task pays
+                // only the escalation it needs. The gate stays the sole
+                // arbiter — a cascade only changes WHO is dispatched.
+                // `pick_for_attempt` consults the cascade (skipped when an
+                // explicit `--worker` filter is set) and falls back to UCB1
+                // when the attempt is past the cascade, the cascade worker
+                // is disabled, or it is busy. The attempt number is read
+                // from persisted status (next attempt = attempts + 1)
+                // BEFORE worker selection.
+                let next_attempt = status.get(&t.id).map(|s| s.attempts).unwrap_or(0) + 1;
+                let worker = match pick_for_attempt(
                     &cfg,
+                    &t,
+                    next_attempt,
                     &worker_busy,
                     &worker_backoff,
                     &router,
@@ -907,7 +1002,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                     if pace_retries
                         && retry_delay_s > 0
                         && attempt < max_attempts
-                        && matches!(out, Outcome::Failed(_) | Outcome::Infra(_))
+                        && matches!(out, Outcome::Failed(_))
                     {
                         // Observable: one clear line naming the task and
                         // the seconds, in the run log and the task's own
@@ -1123,7 +1218,7 @@ fn finish_resume_verify(
         error: None,
         cost_micros: None,
         contracts: None,
-        kind: None,
+        failure_class: None,
     });
     true
 }
@@ -1367,7 +1462,7 @@ fn heal_stale_attempt(
             error: Some(error),
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         });
         // RerunAgent, or a resume that lost its artifacts (always safe):
         // apply the budget to the now-counted attempt — Ready for a fresh
@@ -1659,8 +1754,9 @@ pub fn dry_run(cfg: &Config, st: &Settings) -> i32 {
             }
         );
     }
-    // Budget (r8-budget-cap): surface an exhausted ceiling in the plan too —
-    // dry-run still creates nothing and still exits 0.
+    // Budget (r8-budget-cap + token-budget-ceiling): surface an exhausted
+    // ceiling in the plan too — dry-run still creates nothing and still
+    // exits 0.
     if st.max_wall_clock_s > 0 {
         let in_scope: Vec<&crate::config::Task> = cfg.tasks.iter().collect();
         let measured = consumed_wall_clock_s(&store.load_receipts(), &in_scope);
@@ -1668,6 +1764,16 @@ pub fn dry_run(cfg: &Config, st: &Settings) -> i32 {
             println!(
                 "  BUDGET: spent {measured:.1}s of {}s cap (AF_MAX_WALL_CLOCK_S) — a run would stop before dispatching new attempts",
                 st.max_wall_clock_s
+            );
+        }
+    }
+    if st.max_tokens > 0 {
+        let in_scope: Vec<&crate::config::Task> = cfg.tasks.iter().collect();
+        let spent = consumed_tokens(&store.load_receipts(), &in_scope);
+        if token_budget_exhausted(st, spent) {
+            println!(
+                "  BUDGET: spent {spent} of {} tokens cap (AF_MAX_TOKENS) — a run would stop before dispatching new attempts",
+                st.max_tokens
             );
         }
     }
@@ -1766,12 +1872,6 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
             .iter()
             .rev()
             .find(|r| r.task == t.id && r.counts_as_verdict());
-        // Latest receipt of any kind (including infra failures, which are
-        // terminal but not verdicts) — used to surface the infra_fail flag.
-        let latest_any = receipts.iter().rev().find(|r| r.task == t.id);
-        let infra_fail = latest_any
-            .map(|r| r.kind.as_deref() == Some("infra"))
-            .unwrap_or(false);
         let verdict = latest.map(|r| r.outcome.as_str()).unwrap_or("none");
         let contracts = latest
             .and_then(|r| r.contracts.as_ref())
@@ -1781,6 +1881,16 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Failure class of the latest FAILED receipt for this task (the
+        // most recent `failed`/`infra` attempt), surfaced so an operator can
+        // see whether the last failure was the worker's (`agent`) or the
+        // infrastructure's (`infra`). `None` when the task has no failed
+        // receipt.
+        let failure_class = receipts
+            .iter()
+            .rev()
+            .find(|r| r.task == t.id && r.outcome == "failed")
+            .and_then(|r| r.failure_class.clone());
         map.insert(
             t.id.clone(),
             serde_json::json!({
@@ -1791,7 +1901,7 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
                 "verify": t.verify,
                 "verdict": verdict,
                 "contracts": contracts,
-                "infra_fail": infra_fail,
+                "failure_class": failure_class,
             }),
         );
     }
@@ -1914,6 +2024,36 @@ fn consumed_wall_clock_s(receipts: &[Receipt], in_scope: &[&crate::config::Task]
 /// `max_wall_clock_s == 0` disables the ceiling (unlimited, legacy).
 fn wall_clock_budget_exhausted(st: &Settings, measured: f64) -> bool {
     st.max_wall_clock_s > 0 && measured >= st.max_wall_clock_s as f64
+}
+
+/// Total tokens spent on in-scope tasks, from the same receipt window the
+/// wall-clock ceiling and `af cost` use. A receipt with `tokens: None`
+/// (interrupted, or a CLI worker without token capture) contributes 0 —
+/// `filter_map` handles this naturally. A `failed` attempt that burned tokens
+/// contributes them, exactly as the wall-clock ceiling counts a failed
+/// attempt's `wall_clock_s`.
+fn consumed_tokens(receipts: &[Receipt], in_scope: &[&crate::config::Task]) -> u64 {
+    select_receipts(receipts, &CostFilter::default())
+        .into_iter()
+        .filter(|r| in_scope.iter().any(|t| t.id == r.task))
+        .filter_map(|r| r.tokens)
+        .sum()
+}
+
+/// Is the campaign's measured token spend at or above its ceiling?
+/// `max_tokens == 0` disables the ceiling (unlimited, the default).
+fn token_budget_exhausted(st: &Settings, consumed: u64) -> bool {
+    st.max_tokens > 0 && consumed >= st.max_tokens
+}
+
+/// Total tokens spent on ONE task's receipts (for the per-task ceiling).
+/// Same window/filter as the campaign ceiling, scoped to a single task.
+fn consumed_tokens_for_task(receipts: &[Receipt], task_id: &str) -> u64 {
+    select_receipts(receipts, &CostFilter::default())
+        .into_iter()
+        .filter(|r| r.task == task_id)
+        .filter_map(|r| r.tokens)
+        .sum()
 }
 
 /// Stable grouping key for a failed attempt's CAUSE: the text before the
@@ -2794,6 +2934,7 @@ mod tests {
             agent_timeout_s: 3600,
             agent_stall_s: 0,
             max_wall_clock_s: 0,
+            max_tokens: 0,
             sandbox_cmd: vec![],
         }
     }
@@ -2956,7 +3097,7 @@ mod tests {
                     contract: "C-M1".into(),
                     verdict: "pass".into(),
                 }]),
-                kind: None,
+                failure_class: None,
             })
             .unwrap();
 
@@ -2979,7 +3120,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // --- startup heal / resume --------------------------------------------
+    #[test]
+    // spec: state/failure-class-on-receipts#status-json-surfaces-the-failure-class
+    fn status_json_surfaces_the_latest_failure_class() {
+        let base = unique_base("status-fc");
+        let st = settings(base.clone());
+        let cfg = cfg_with(vec![task("A"), task("B")]);
+        let mut status = HashMap::new();
+        status.insert(
+            "A".into(),
+            TaskStatus {
+                state: TaskState::Failed,
+                attempts: 1,
+                last_error: Some("harness: HTTP 429".into()),
+                ..Default::default()
+            },
+        );
+        Store::new(st.state_dir.clone()).save(&status).unwrap();
+        let store = Store::new(st.state_dir.clone());
+        store
+            .append_receipt(&Receipt {
+                task: "A".into(),
+                attempt: 1,
+                worker: "w1".into(),
+                model: "m".into(),
+                wall_clock_s: 1.0,
+                tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                ts: 1,
+                outcome: "failed".into(),
+                error: Some("harness: HTTP 429".into()),
+                cost_micros: None,
+                contracts: None,
+                failure_class: Some("infra".into()),
+            })
+            .unwrap();
+
+        let out = status_json(&cfg, &st);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("status_json is valid JSON");
+        assert_eq!(
+            v["A"]["failure_class"], "infra",
+            "most recent failed receipt's class surfaces"
+        );
+        assert!(
+            v["B"]["failure_class"].is_null(),
+            "no failed receipt for B → null"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn heal_stale_attempt_reruns_unproven_agents_from_ready() {
@@ -3225,7 +3416,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         store.append_receipt(&receipt("A", 10.0, "merged")).unwrap();
         store.append_receipt(&receipt("A", 5.5, "failed")).unwrap();
@@ -3275,7 +3466,7 @@ mod tests {
             error: error.map(str::to_string),
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         // No error on the receipt → the literal key.
         assert_eq!(waste_cause(&r(None)), "unknown");
@@ -3375,7 +3566,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
-                kind: None,
+                failure_class: None,
             };
         // A: a failed retry then a merge on another worker. B: a same-ts
         // tie between attempts 1/2 — the greater attempt must win. C: two
@@ -3493,7 +3684,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         store
             .append_receipt(&rcpt(1, 1_600_000_000, 100.0, "w1", "failed"))
@@ -3578,7 +3769,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         // The mean over the verdict attempts, one decimal.
         let merged = rcpt(2.0, "merged");
@@ -3657,7 +3848,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         // Every attempt Priced: the dollars SUM (500k + 250k at $2/Mtok).
         let r1 = rcpt("pw", Some(500_000));
@@ -3750,7 +3941,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         // One measured + one price-estimated attempt → named source plus
         // the estimate count, exactly the shape the report prints.
@@ -3807,7 +3998,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         // Measured beats declared: 500k tokens at $2/Mtok would estimate to
         // $1.0000, but the provider reported $0.0123 — the measurement wins
@@ -4003,6 +4194,122 @@ mod tests {
         assert!(
             st.state_dir.join("stop").exists(),
             "stop wish is recorded even without a live orchestrator"
+        );
+    }
+
+    // --- cascade (escalation) routing -------------------------------------
+
+    fn busy_with(names: &[&str]) -> std::sync::Mutex<HashMap<String, usize>> {
+        let mut m = HashMap::new();
+        for n in names {
+            m.insert(n.to_string(), 1);
+        }
+        std::sync::Mutex::new(m)
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#first-attempt-runs-the-cheapest-cascade-worker
+    // spec: scheduling/cascade-escalation-routing#a-failed-attempt-escalates-to-the-next-worker
+    // spec: scheduling/cascade-escalation-routing#past-the-cascade-the-router-picks-again
+    // spec: scheduling/cascade-escalation-routing#a-task-without-a-cascade-keeps-ucb1
+    fn cascade_picks_cheapest_first_and_escalates_by_attempt() {
+        let cfg = cfg_with_workers(
+            vec![],
+            vec![
+                worker_named("cheap"),
+                worker_named("pro"),
+                worker_named("opus"),
+            ],
+        );
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into(), "pro".into(), "opus".into()]);
+        let idle = std::sync::Mutex::new(HashMap::<String, usize>::new());
+        let router = Router::default();
+
+        // Attempt 1 → cheap; attempt 2 → pro; attempt 3 → opus.
+        fn wname(w: Option<&crate::config::Worker>) -> Option<String> {
+            w.map(|w| w.name.clone())
+        }
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 1, &idle)),
+            Some("cheap".to_string())
+        );
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 2, &idle)),
+            Some("pro".to_string())
+        );
+        assert_eq!(
+            wname(cascade_worker(&cfg, &t, 3, &idle)),
+            Some("opus".to_string())
+        );
+        // Past the cascade → None (caller falls back to UCB1).
+        assert!(cascade_worker(&cfg, &t, 4, &idle).is_none());
+        // No cascade → None.
+        let no_cascade = task("B");
+        assert!(cascade_worker(&cfg, &no_cascade, 1, &idle).is_none());
+        // The end-to-end decision (`pick_for_attempt`) indexes the cascade
+        // by attempt, and a task without a cascade goes straight to UCB1.
+        let backoff = std::sync::Mutex::new(HashMap::new());
+        assert_eq!(
+            wname(pick_for_attempt(
+                &cfg, &t, 2, &idle, &backoff, &router, None
+            )),
+            Some("pro".to_string())
+        );
+        assert_eq!(
+            wname(pick_for_attempt(
+                &cfg,
+                &no_cascade,
+                1,
+                &idle,
+                &backoff,
+                &router,
+                None
+            )),
+            Some("cheap".to_string()),
+            "no cascade → first configured worker via UCB1"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#an-explicit-worker-pin-overrides-the-cascade
+    fn worker_filter_overrides_the_cascade() {
+        let cfg = cfg_with_workers(vec![], vec![worker_named("cheap"), worker_named("pro")]);
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into()]);
+        let idle = std::sync::Mutex::new(HashMap::<String, usize>::new());
+        let backoff = std::sync::Mutex::new(HashMap::new());
+        let router = Router::default();
+        let w = pick_for_attempt(&cfg, &t, 1, &idle, &backoff, &router, Some("pro"));
+        assert_eq!(
+            w.unwrap().name,
+            "pro",
+            "the pinned worker wins over the cascade"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/cascade-escalation-routing#a-busy-or-disabled-cascade-worker-falls-back-to-ucb1
+    fn cascade_falls_back_when_worker_busy_or_disabled() {
+        let mut cheap = worker_named("cheap");
+        cheap.enabled = false;
+        let cfg = cfg_with_workers(vec![], vec![cheap, worker_named("pro")]);
+        let mut t = task("A");
+        t.cascade = Some(vec!["cheap".into(), "pro".into()]);
+
+        // Disabled first rung → None → UCB1 fallback.
+        assert!(cascade_worker(&cfg, &t, 1, &busy_with(&[])).is_none());
+        // Busy first rung → None (the caller falls back rather than stall).
+        let busy = busy_with(&["cheap"]);
+        let cfg2 = cfg_with_workers(vec![], vec![worker_named("cheap"), worker_named("pro")]);
+        assert!(cascade_worker(&cfg2, &t, 1, &busy).is_none());
+        // Second rung engaged and idle is picked.
+        fn wname(w: Option<&crate::config::Worker>) -> Option<String> {
+            w.map(|w| w.name.clone())
+        }
+        assert_eq!(
+            wname(cascade_worker(&cfg2, &t, 2, &busy)),
+            Some("pro".to_string())
         );
     }
 }

@@ -145,13 +145,21 @@ pub struct Receipt {
     /// (verify AND merged tasks). `None` when no report was present/parseable.
     #[serde(default)]
     pub contracts: Option<Vec<ContractVerdict>>,
-    /// Infra-failure label: `Some("infra")` on a provider/environment
-    /// failure (see `OUTCOME_INFRA`), `None` on every other outcome.
-    /// Legacy receipts (no `kind` key) deserialize as `None`, so the field
-    /// is purely additive. Not a verdict: `counts_as_verdict()` is false
-    /// for `infra_failed`, so an infra outage never enters UCB1 trust.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    /// Failure class when the attempt FAILED: `"infra"` (a harness,
+    /// transport, or environment problem — provider error, timeout, stall,
+    /// missing binary, git/io error, harness budget wall — that is NOT a
+    /// verdict on this worker's reliability) or `"agent"` (the agent's work
+    /// itself was wrong: non-zero exit, gate failure, scope violation, no
+    /// change). `None` for non-failed receipts (merged/verified),
+    /// `interrupted`/`recovered` bookkeeping receipts, and legacy receipts.
+    /// Trust statistics SHALL exclude `"infra"` receipts from the numerator
+    /// AND the denominator ([`Receipt::counts_as_verdict`]) — the worker did
+    /// not fail, the infrastructure did. An infra failure still counts
+    /// toward the task's `attempts` / `max_attempts` retry budget (an
+    /// attempt genuinely happened) and toward cost totals (the tokens were
+    /// spent); only the trust statistic ignores it.
+    #[serde(default)]
+    pub failure_class: Option<String>,
 }
 
 /// Outcome recorded for an attempt lost because the orchestrator itself died
@@ -165,14 +173,6 @@ pub const OUTCOME_INTERRUPTED: &str = "interrupted";
 /// receipt whose work was merged.
 pub const OUTCOME_RECOVERED: &str = "recovered";
 
-/// Outcome recorded for an attempt that failed because of infrastructure
-/// (the LLM provider/transport — a 5xx, a connect error, an empty
-/// response), NOT because the worker's work was wrong. The attempt is
-/// terminal (the task is marked `Failed`) but the receipt is labeled
-/// `kind: Some("infra")` and `counts_as_verdict()` is false, so an infra
-/// outage never dents the worker's UCB1 trust — it is not a verdict on
-/// the worker's reliability. See `Outcome::Infra` in `execute.rs`.
-pub const OUTCOME_INFRA: &str = "infra_failed";
 impl Receipt {
     /// Does this outcome count as a verdict on the WORKER's reliability?
     ///
@@ -180,14 +180,15 @@ impl Receipt {
     /// excluded because the attempt was lost when the orchestrator itself
     /// died (no agent result, no gate result); [`OUTCOME_RECOVERED`] is
     /// excluded because no agent ran at all — recovery re-validates and
-    /// merges work that was already paid for. [`OUTCOME_INFRA`] is excluded
-    /// because a provider/transport outage is not a verdict on the worker's
-    /// reliability — the attempt is terminal (task `Failed`) but labeled
-    /// `kind: Some("infra")` so UCB1 never dents the worker for it. Every
-    /// trust statistic must exclude all of these from the numerator AND
-    /// the denominator.
+    /// merges work that was already paid for. A `failed` attempt whose
+    /// [`failure_class`](Self::failure_class) is `"infra"` is also excluded:
+    /// the infrastructure (provider, transport, harness, git/io) failed, not
+    /// the worker, so it must never lower the worker's trust. Every trust
+    /// statistic must exclude all of these from the numerator AND the
+    /// denominator.
     pub fn counts_as_verdict(&self) -> bool {
-        self.outcome == "merged" || self.outcome == "failed" || self.outcome == "verified"
+        (self.outcome == "merged" || self.outcome == "failed" || self.outcome == "verified")
+            && self.failure_class.as_deref() != Some("infra")
     }
 
     /// Whether this receipt represents a successful outcome (a verdict).
@@ -639,7 +640,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
-                kind: None,
+                failure_class: None,
             })
             .unwrap();
         store
@@ -658,7 +659,7 @@ mod tests {
                 error: Some("agent exited 7".into()),
                 cost_micros: None,
                 contracts: None,
-                kind: None,
+                failure_class: None,
             })
             .unwrap();
         let rs = store.load_receipts();
@@ -686,7 +687,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         assert!(r.counts_as_verdict(), "verified must count as a verdict");
     }
@@ -709,7 +710,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
-                kind: None,
+                failure_class: None,
             };
             assert!(r.is_success(), "{outcome} must count as a success");
         }
@@ -728,87 +729,9 @@ mod tests {
             error: Some("boom".into()),
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         };
         assert!(!failed.is_success(), "failed must NOT count as a success");
-    }
-
-    #[test]
-    fn infra_receipt_round_trips_and_is_labeled() {
-        // An infra failure is serialized with kind: "infra" and outcome
-        // "infra_failed"; it round-trips and is excluded from verdict/success.
-        let r = Receipt {
-            task: "A".into(),
-            attempt: 1,
-            worker: "w1".into(),
-            model: "m".into(),
-            wall_clock_s: 1.0,
-            tokens: None,
-            turns: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            ts: 0,
-            outcome: OUTCOME_INFRA.to_string(),
-            error: Some("harness: provider http 500".into()),
-            cost_micros: None,
-            contracts: None,
-            kind: Some("infra".into()),
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        assert!(
-            s.contains(r#""kind":"infra""#),
-            "infra receipt serializes kind: {s}"
-        );
-        assert!(
-            s.contains(r#""outcome":"infra_failed""#),
-            "infra receipt serializes outcome: {s}"
-        );
-        let back: Receipt = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.outcome, OUTCOME_INFRA);
-        assert_eq!(back.kind.as_deref(), Some("infra"));
-        assert!(!back.counts_as_verdict(), "infra is not a worker verdict");
-        assert!(!back.is_success(), "infra is not a success");
-    }
-
-    #[test]
-    fn legacy_receipt_without_kind_deserializes_as_none() {
-        // A legacy receipt (no `kind` key) deserializes as None — the field
-        // is purely additive and never breaks older state files.
-        let body = r#"{"task":"A","attempt":1,"worker":"w","model":"m","wall_clock_s":1.0,"tokens":null,"ts":0,"outcome":"failed","error":"boom"}"#;
-        let r: Receipt = serde_json::from_str(body).unwrap();
-        assert_eq!(r.kind, None, "missing kind key defaults to None");
-        // And a None kind is NOT serialized (skip_serializing_if), so a
-        // normal failed receipt stays byte-identical to the legacy form.
-        let s = serde_json::to_string(&r).unwrap();
-        assert!(!s.contains(r#""kind""#), "None kind is skipped: {s}");
-    }
-
-    #[test]
-    fn infra_outcome_excluded_from_verdict_and_success() {
-        for outcome in [OUTCOME_INFRA, OUTCOME_INTERRUPTED, OUTCOME_RECOVERED] {
-            let r = Receipt {
-                task: "A".into(),
-                attempt: 1,
-                worker: "w1".into(),
-                model: "m".into(),
-                wall_clock_s: 1.0,
-                tokens: None,
-                turns: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                ts: 0,
-                outcome: outcome.to_string(),
-                error: None,
-                cost_micros: None,
-                contracts: None,
-                kind: None,
-            };
-            assert!(
-                !r.counts_as_verdict(),
-                "{outcome} must NOT count as a verdict"
-            );
-            assert!(!r.is_success(), "{outcome} must NOT count as a success");
-        }
     }
 
     #[test]
@@ -821,5 +744,69 @@ mod tests {
         assert_eq!(s, r#"{"contract":"C-M1","verdict":"pass"}"#);
         let back: ContractVerdict = serde_json::from_str(&s).unwrap();
         assert_eq!(back, cv);
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#infra-failures-are-not-trust-verdicts
+    fn infra_failed_receipt_is_not_a_verdict() {
+        for cls in ["infra", "agent"] {
+            let mut r = Receipt {
+                task: "A".into(),
+                attempt: 1,
+                worker: "w1".into(),
+                model: "m".into(),
+                wall_clock_s: 1.0,
+                tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                ts: 0,
+                outcome: "failed".into(),
+                error: Some("x".into()),
+                cost_micros: None,
+                contracts: None,
+                failure_class: Some(cls.into()),
+            };
+            if cls == "infra" {
+                assert!(
+                    !r.counts_as_verdict(),
+                    "an infra failure is NOT a verdict on the worker"
+                );
+            } else {
+                assert!(
+                    r.counts_as_verdict(),
+                    "an agent failure IS a verdict on the worker"
+                );
+            }
+            // A merged receipt never has a failure class; nothing breaks.
+            r.outcome = "merged".into();
+            r.failure_class = None;
+            assert!(r.counts_as_verdict());
+        }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#legacy-failed-receipts-stay-verdicts
+    fn legacy_failed_receipt_without_failure_class_is_a_verdict() {
+        let r = Receipt {
+            task: "A".into(),
+            attempt: 1,
+            worker: "w1".into(),
+            model: "m".into(),
+            wall_clock_s: 1.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: "failed".into(),
+            error: Some("agent exited NonZero (code 7)".into()),
+            cost_micros: None,
+            contracts: None,
+            failure_class: None,
+        };
+        // Backward compatible: a pre-failure-class receipt deserializes with
+        // failure_class None and still counts as a verdict (today's behavior).
+        assert!(r.counts_as_verdict());
     }
 }

@@ -84,6 +84,7 @@ fn fixture(tasks_json: &str, workers_json: &str) -> Fixture {
         agent_timeout_s: 60,
         agent_stall_s: 0,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     Fixture { dir, repo, cfg, st }
@@ -2356,7 +2357,7 @@ fn reuse_writes_a_recovered_receipt() {
             error: Some("acceptance gate failed (exit 1): boom".into()),
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         })
         .unwrap();
 

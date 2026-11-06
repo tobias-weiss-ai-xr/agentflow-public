@@ -69,6 +69,7 @@ impl Fixture {
             agent_timeout_s: 60,
             agent_stall_s: 0,
             max_wall_clock_s: 0,
+            max_tokens: 0,
             sandbox_cmd: vec![],
         };
         Fixture { dir, cfg, st }
@@ -108,7 +109,7 @@ fn receipt(
         error: error.map(str::to_string),
         cost_micros: None,
         contracts: None,
-        kind: None,
+        failure_class: None,
     }
 }
 

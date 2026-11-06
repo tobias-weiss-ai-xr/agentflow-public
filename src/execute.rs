@@ -16,11 +16,6 @@ pub enum Outcome {
     Merged,
     Verified,
     Failed(String),
-    /// A provider/transport failure (5xx, connect error, empty
-    /// response) — infrastructure, not the worker's work. Terminal
-    /// (task `Failed`) but labeled `infra_failed` so UCB1 excludes it
-    /// (`counts_as_verdict()` is false for `OUTCOME_INFRA`).
-    Infra(String),
 }
 
 #[derive(Clone)]
@@ -109,8 +104,42 @@ fn outcome_name(o: &Outcome) -> &'static str {
         Outcome::Merged => "merged",
         Outcome::Verified => "verified",
         Outcome::Failed(_) => "failed",
-        Outcome::Infra(_) => "infra_failed",
     }
+}
+
+/// Classify a failed attempt's reason into a failure class, so receipts can
+/// distinguish "the worker was wrong" (`agent`) from "the infrastructure
+/// failed" (`infra`). Every failure reason agentflow produces has a
+/// controlled prefix; the classification matches those signals. `Some("infra")`
+/// for a harness/transport/environment/budget wall (provider error, timeout,
+/// stall, missing binary, kill, git/io error, harness failure incl. turn cap);
+/// `Some("agent")` for everything else where the work itself was judged
+/// wrong or missing (non-zero exit, gate failure, scope violation, zero
+/// commits, merge verification failure). `None` for a non-failure (the
+/// caller passes only failed reasons).
+///
+/// This is the single source of truth: `execute_task` classifies the
+/// persisted receipt, and `reap` classifies the LIVE router update from the
+/// same reason string with the same function, so replay and runtime always
+/// agree.
+pub fn classify_failure(error: &str) -> &'static str {
+    let e = error.to_ascii_lowercase();
+    const INFRA: [&str; 8] = [
+        "harness",    // native harness failures incl. `turn cap`, provider error, `stop=Timeout`
+        "timeout",    // total agent timeout
+        "stall",      // stall watchdog
+        "missing",    // binary not found
+        "kill",       // killed by us / orchestration
+        "cannot",     // git/io errors: cannot write prompt, cannot commit, cannot compute diff
+        "provider",   // explicit provider errors
+        "connection", // transport
+    ];
+    for sig in INFRA {
+        if e.contains(sig) {
+            return "infra";
+        }
+    }
+    "agent"
 }
 
 pub fn execute_task(
@@ -125,16 +154,15 @@ pub fn execute_task(
     // Receipt for EVERY attempt (merged + failed) — routing/cost substrate.
     let outcome_name = outcome_name(&outcome);
     let error = match &outcome {
-        Outcome::Failed(e) | Outcome::Infra(e) => {
-            Some(e.lines().next().unwrap_or("").chars().take(200).collect())
-        }
+        Outcome::Failed(e) => Some(e.lines().next().unwrap_or("").chars().take(200).collect()),
         Outcome::Merged | Outcome::Verified => None,
     };
-    // Infra failures are labeled so UCB1 can exclude them: a provider
-    // outage is not a verdict on the worker's reliability.
-    let kind = match &outcome {
-        Outcome::Infra(_) => Some("infra".to_string()),
-        _ => None,
+    // Failure class (infra vs agent) from the FULL reason before truncation,
+    // so the receipt and the live router (`reap`) classify the same attempt
+    // identically (`classify_failure` is the single source of truth).
+    let failure_class = match &outcome {
+        Outcome::Failed(e) => Some(crate::execute::classify_failure(e).to_string()),
+        Outcome::Merged | Outcome::Verified => None,
     };
     let _ = ctx.store.append_receipt(&Receipt {
         task: id.to_string(),
@@ -151,7 +179,7 @@ pub fn execute_task(
         error,
         cost_micros: spend.cost_micros,
         contracts,
-        kind,
+        failure_class,
     });
     outcome
 }
@@ -401,7 +429,7 @@ fn execute_attempt(
         // is logged by the harness itself. Its outcome synthesizes the SAME
         // CmdKind contract as a CLI child, so all downstream handling
         // (work integrity, gate, merge, retry memory) is byte-identical.
-        let (agent_out, native_stop) = if native {
+        let agent_out = if native {
             let out = crate::harness::run(
                 worker,
                 &prompt,
@@ -420,20 +448,16 @@ fn execute_attempt(
             spend.turns = Some(out.turns);
             spend.prompt_tokens = out.prompt_tokens;
             spend.completion_tokens = out.completion_tokens;
-            let stop = out.stop;
-            (
-                crate::subprocess::CmdOut {
-                    kind: out.stop.cmd_kind(),
-                    code: if out.stop == crate::harness::Stop::Normal {
-                        Some(0)
-                    } else {
-                        None
-                    },
-                    stdout: out.final_text,
-                    stderr: out.error.unwrap_or_default(),
+            crate::subprocess::CmdOut {
+                kind: out.stop.cmd_kind(),
+                code: if out.stop == crate::harness::Stop::Normal {
+                    Some(0)
+                } else {
+                    None
                 },
-                Some(stop),
-            )
+                stdout: out.final_text,
+                stderr: out.error.unwrap_or_default(),
+            }
         } else {
             // Stall watchdog (agent CLI ONLY — git and gate calls stay on plain
             // `run`: a silent gate is not necessarily a stalled one, and their
@@ -444,17 +468,14 @@ fn execute_attempt(
             } else {
                 Some(Duration::from_secs(ctx.st.agent_stall_s))
             };
-            (
-                crate::subprocess::run_with_stall(
-                    &agent_cmd,
-                    &agent_args,
-                    Some(&wt_path),
-                    &env_pairs,
-                    env_mode,
-                    Duration::from_secs(ctx.st.agent_timeout_s),
-                    stall,
-                ),
-                None,
+            crate::subprocess::run_with_stall(
+                &agent_cmd,
+                &agent_args,
+                Some(&wt_path),
+                &env_pairs,
+                env_mode,
+                Duration::from_secs(ctx.st.agent_timeout_s),
+                stall,
             )
         };
         // Native failures return early with the PRECISE reason (`harness: …`)
@@ -473,15 +494,6 @@ fn execute_attempt(
             } else {
                 agent_out.stderr.clone()
             };
-            // A provider/transport failure (5xx, connect error, empty
-            // response) is INFRA, not a worker-verdict failure: the
-            // attempt is terminal (task Failed) but labeled
-            // `infra_failed` so UCB1 excludes it from the worker's
-            // trust. Turn-cap and timeout stay ordinary failures — they
-            // are budget/quality signals about the worker.
-            if native_stop == Some(crate::harness::Stop::ProviderError) {
-                return (Outcome::Infra(format!("{reason}{kept}")), spend, None);
-            }
             return (Outcome::Failed(format!("{reason}{kept}")), spend, None);
         }
         // JSON output mode (r9-token-capture): the stream is telemetry,
@@ -1335,7 +1347,7 @@ mod tests {
             error: error.map(|e| e.into()),
             cost_micros: None,
             contracts: None,
-            kind: None,
+            failure_class: None,
         }
     }
 
@@ -1414,7 +1426,7 @@ mod tests {
                     })
                     .collect(),
             ),
-            kind: None,
+            failure_class: None,
         }
     }
 
@@ -1464,6 +1476,42 @@ mod tests {
         assert_eq!(outcome_name(&Outcome::Verified), "verified");
         assert_eq!(outcome_name(&Outcome::Merged), "merged");
         assert_eq!(outcome_name(&Outcome::Failed("x".into())), "failed");
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#provider-signal-reasons-classify-as-infra
+    fn classify_failure_tags_infra_signals() {
+        let infra = [
+            "agent exited Timeout (code -)",
+            "agent stalled: produced no output for 30s (stall window, AF_AGENT_STALL_S=30); killed before agent_timeout_s=3600",
+            "agent exited Missing (code -)",
+            "agent exited Killed (code -)",
+            "harness: turn cap 12 reached",
+            "harness: HTTP 429 Too Many Requests",
+            "harness failed (ProviderError)",
+            "cannot write prompt: read-only file system",
+            "cannot commit the agent's uncommitted work: index.lock exists",
+            "cannot compute attempt diff (main...HEAD): fatal: bad revision",
+        ];
+        for e in infra {
+            assert_eq!(classify_failure(e), "infra", "expected infra for: {e}");
+        }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#work-judgement-reasons-classify-as-agent
+    fn classify_failure_tags_agent_signals() {
+        let agent = [
+            "agent exited NonZero (code 7)",
+            "gate failed (exit 1): test -f DONE.txt",
+            "scope violation: src/lib.rs outside scope [\"src/**\"]",
+            "zero commits: attempt branch carries no commits beyond main; use the wildcard for empty scope if intended",
+            "merge of tf/A-1-123 reported success but the base does not contain it",
+            "no change produced",
+        ];
+        for e in agent {
+            assert_eq!(classify_failure(e), "agent", "expected agent for: {e}");
+        }
     }
 
     #[test]
@@ -1541,6 +1589,7 @@ model {{MODEL}}/{{PROVIDER}}
             agent_timeout_s: 60,
             agent_stall_s: 0,
             max_wall_clock_s: 0,
+            max_tokens: 0,
             sandbox_cmd: vec![],
         };
         let task = crate::config::Task {

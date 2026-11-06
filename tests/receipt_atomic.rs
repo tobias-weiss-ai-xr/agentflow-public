@@ -44,7 +44,7 @@ fn receipt(task: &str, attempt: u32, wall: f64, ts: u64) -> Receipt {
         error: None,
         cost_micros: None,
         contracts: None,
-        kind: None,
+        failure_class: None,
     }
 }
 

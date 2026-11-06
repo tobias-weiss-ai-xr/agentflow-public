@@ -154,7 +154,7 @@ af validate [--worker NAME]
 |------|---------|
 | `0` | Done — every in-scope task reached `done` (or `--dry-run`/`--once` finished its work) |
 | `2` | Configuration error, unknown flag/command, or **deadlock** (no task can make progress) |
-| `3` | Stopped early — the wall-clock budget was exhausted before every in-scope task could be started |
+| `3` | Stopped early — the wall-clock **or token** budget was exhausted before every in-scope task could be started |
 
 ### Campaign budget (`AF_MAX_WALL_CLOCK_S`)
 
@@ -175,6 +175,31 @@ persisted, so the cap survives restarts and counts across runs).
 - `af run --dry-run` prints the same budget line when the spend is already
   over the cap, still creating nothing and still exiting `0`.
 
+### Campaign token budget (`AF_MAX_TOKENS`)
+
+A campaign can also be given a spend ceiling **in tokens**. `AF_MAX_TOKENS`
+(default `0`) is compared against the sum of the `tokens` field over the
+receipts for the in-scope tasks — the same `TOKENS` column `af cost`
+reports, so the enforced number is the number the operator sees. Receipts
+are persisted, so the cap survives restarts and counts across runs; a
+receipt with no recorded tokens (`tokens: None`, e.g. an interrupted
+attempt or a CLI worker without token capture) contributes `0`.
+
+- `0` = **unlimited**, the legacy behaviour — exactly as before.
+- When the measured token spend is **at or above** the cap, `af run` stops
+  dispatching **new** attempts (in-flight attempts still finish) and exits
+  `3` with a diagnostic naming the spend, the cap, and the count of
+  not-started tasks. Either ceiling — wall-clock or tokens — can stop a
+  run; the diagnostic names which one bit.
+- **Per-task cap**: a task may declare its own `max_tokens` (e.g. `50000`).
+  Before each dispatch, `af` sums that task's receipts; when the sum is
+  **at or above** the per-task cap, the task is marked `failed` with a
+  reason naming the spend and the cap, and no further agent is dispatched
+  for it. `0` (or absent) = no per-task cap. The per-task cap composes with
+  the campaign cap, `max_turns`, and `max_attempts`.
+- `af run --dry-run` prints the token budget line when the spend is already
+  over the cap, still creating nothing and still exiting `0`.
+
 `af cost` aggregates the receipts every attempt appends to `state/receipts/`.
 Plain `af cost` totals every attempt; `--last` narrows to the most recent
 receipt per task (the greatest `ts`, ties broken by the greater attempt
@@ -183,8 +208,7 @@ receipts with `ts >=` the instant — `DATE` is `YYYY-MM-DD` (UTC midnight) or
 a bare unix timestamp, applied before `--last` so `--last --since D` is
 "the latest attempt per task since D". The window flags compose with each
 other and with `--task ID` (which narrows the table rows); the TOTAL line
-and the per-worker trust block are always computed over the selected
-receipts only.
+and the per-worker trust block are always computed over the selectedreceipts only.
 
 The table also carries a `TOKENS` column: it sums the `tokens` recorded on
 the selected receipts and shows `-` when they carry none, so a report over
@@ -316,7 +340,9 @@ to block the command: the readable history is still accounted for.
 | `priority` | Tie-breaker when multiple tasks are ready. **Higher sorts first** (`CRITICAL`=20 > `HIGH`=10 > `MEDIUM`=0 > `LOW`=-10; numbers keep their value). The "P1 = highest priority" convention is the OPPOSITE of af's scale — declare p1-tasks as `"priority": 10` (or `"HIGH"`), not `1`. |
 | `gate_replay` | Whether the gate is replay-safe (default `true`); `false` = side effects |
 | `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 Often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
+| `max_tokens` | Per-task token ceiling (default `0`/absent = no cap): before each dispatch af sums this task's receipts and, at/above the cap, marks the task `failed` with a reason naming the spend and the cap — no further agent runs for it. Composes with `AF_MAX_TOKENS`, `max_turns` and `max_attempts`. |
 | `readonly` | `true` = investigation-only: the builtin harness rejects `write`/`edit`, the attempt counts done on a normal agent stop (no gate, no merge) |
+| `cascade` | Ordered list of worker names tried CHEAPEST-FIRST across attempts: attempt 1 runs `cascade[0]`, attempt 2 escalates to `cascade[1]`, and so on — a hard task pays only the escalation it needs. When the attempt is past the cascade, the worker is busy, or it is disabled, af falls back to normal UCB1 routing. An explicit `--worker` pin overrides the cascade. The acceptance gate stays the sole arbiter (a cascade only changes WHO is dispatched). Validation rejects unknown worker names, duplicates, and an empty array. |
 | `verify` | `true` = verification task: the acceptance gate is the sole deliverable; the branch is archived (never merged) and the receipt records `verified`. Rejected with `manual`, `readonly`, or no `accept` gate. |
 
 Replay contract: the `accept` command MUST be idempotent; declare
@@ -496,6 +522,27 @@ score(worker) =  mean(worker)  +  sqrt( 2 * ln(N + 1) / (n + 1) )
   (`af cost`'s TRUST column shows the raw `wins ÷ attempts` rate, so measured
 data stays measured; the smoothed version is the routing term only.)
 - `N` = total attempts across all workers; `n` = this worker's attempts.
+
+A **failure class** tells the router whose fault a failure was. Every failed
+receipt records `failure_class`: `"infra"` when the harness, transport or
+environment failed (provider error, timeout, stall watchdog, missing
+binary, git/io error, native-harness turn cap) and `"agent"` when the work
+itself was judged wrong (non-zero exit, gate failure, scope violation, zero
+commits). An `infra` failure is **not a verdict**: it never enters `WINS` or
+`TOTAL`, so a provider outage or a turn-cap death stops poisoning a worker's
+trust (it still burns one `max_attempts` retry and its tokens still count in
+`af cost`). An `agent` failure lowers trust exactly as before. `af status
+--json` surfaces each task's latest `failure_class` (`null` when none).
+
+**Cascade (escalation) routing** is the per-task counterweight to the global
+router: a task may declare `cascade: ["cheap", "pro"]` to start the
+cheapest worker and escalate to the next on each retry, so a hard task pays
+only the escalation the gate demands. Attempt 1 runs `cascade[0]`, attempt 2
+runs `cascade[1]`, and so on; past the cascade — or when the rung is busy or
+disabled — routing falls back to UCB1 exactly as without a cascade. An
+`--worker` pin overrides the cascade. The acceptance gate stays the sole
+arbiter: a cascade only changes WHO is dispatched, never whether work is
+accepted.
 
 A tie between equally scoring workers is broken in a fixed order: the cheaper
 DECLARED basis (`params_b` / `price_per_mtok_usd`) first, then the strictly
