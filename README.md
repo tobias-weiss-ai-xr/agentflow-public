@@ -154,7 +154,7 @@ af validate [--worker NAME]
 |------|---------|
 | `0` | Done — every in-scope task reached `done` (or `--dry-run`/`--once` finished its work) |
 | `2` | Configuration error, unknown flag/command, or **deadlock** (no task can make progress) |
-| `3` | Stopped early — the wall-clock budget was exhausted before every in-scope task could be started |
+| `3` | Stopped early — the wall-clock **or token** budget was exhausted before every in-scope task could be started |
 
 ### Campaign budget (`AF_MAX_WALL_CLOCK_S`)
 
@@ -175,6 +175,31 @@ persisted, so the cap survives restarts and counts across runs).
 - `af run --dry-run` prints the same budget line when the spend is already
   over the cap, still creating nothing and still exiting `0`.
 
+### Campaign token budget (`AF_MAX_TOKENS`)
+
+A campaign can also be given a spend ceiling **in tokens**. `AF_MAX_TOKENS`
+(default `0`) is compared against the sum of the `tokens` field over the
+receipts for the in-scope tasks — the same `TOKENS` column `af cost`
+reports, so the enforced number is the number the operator sees. Receipts
+are persisted, so the cap survives restarts and counts across runs; a
+receipt with no recorded tokens (`tokens: None`, e.g. an interrupted
+attempt or a CLI worker without token capture) contributes `0`.
+
+- `0` = **unlimited**, the legacy behaviour — exactly as before.
+- When the measured token spend is **at or above** the cap, `af run` stops
+  dispatching **new** attempts (in-flight attempts still finish) and exits
+  `3` with a diagnostic naming the spend, the cap, and the count of
+  not-started tasks. Either ceiling — wall-clock or tokens — can stop a
+  run; the diagnostic names which one bit.
+- **Per-task cap**: a task may declare its own `max_tokens` (e.g. `50000`).
+  Before each dispatch, `af` sums that task's receipts; when the sum is
+  **at or above** the per-task cap, the task is marked `failed` with a
+  reason naming the spend and the cap, and no further agent is dispatched
+  for it. `0` (or absent) = no per-task cap. The per-task cap composes with
+  the campaign cap, `max_turns`, and `max_attempts`.
+- `af run --dry-run` prints the token budget line when the spend is already
+  over the cap, still creating nothing and still exiting `0`.
+
 `af cost` aggregates the receipts every attempt appends to `state/receipts/`.
 Plain `af cost` totals every attempt; `--last` narrows to the most recent
 receipt per task (the greatest `ts`, ties broken by the greater attempt
@@ -183,8 +208,7 @@ receipts with `ts >=` the instant — `DATE` is `YYYY-MM-DD` (UTC midnight) or
 a bare unix timestamp, applied before `--last` so `--last --since D` is
 "the latest attempt per task since D". The window flags compose with each
 other and with `--task ID` (which narrows the table rows); the TOTAL line
-and the per-worker trust block are always computed over the selected
-receipts only.
+and the per-worker trust block are always computed over the selectedreceipts only.
 
 The table also carries a `TOKENS` column: it sums the `tokens` recorded on
 the selected receipts and shows `-` when they carry none, so a report over
@@ -316,6 +340,7 @@ to block the command: the readable history is still accounted for.
 | `priority` | Tie-breaker when multiple tasks are ready. **Higher sorts first** (`CRITICAL`=20 > `HIGH`=10 > `MEDIUM`=0 > `LOW`=-10; numbers keep their value). The "P1 = highest priority" convention is the OPPOSITE of af's scale — declare p1-tasks as `"priority": 10` (or `"HIGH"`), not `1`. |
 | `gate_replay` | Whether the gate is replay-safe (default `true`); `false` = side effects |
 | `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 Often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
+| `max_tokens` | Per-task token ceiling (default `0`/absent = no cap): before each dispatch af sums this task's receipts and, at/above the cap, marks the task `failed` with a reason naming the spend and the cap — no further agent runs for it. Composes with `AF_MAX_TOKENS`, `max_turns` and `max_attempts`. |
 | `readonly` | `true` = investigation-only: the builtin harness rejects `write`/`edit`, the attempt counts done on a normal agent stop (no gate, no merge) |
 | `verify` | `true` = verification task: the acceptance gate is the sole deliverable; the branch is archived (never merged) and the receipt records `verified`. Rejected with `manual`, `readonly`, or no `accept` gate. |
 

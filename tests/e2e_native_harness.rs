@@ -222,6 +222,7 @@ fn fixture(tasks_json: &str, workers_json: &str) -> Fixture {
         agent_stall_s: 0,
         agent_max_turns: 0,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     Fixture { dir, repo, cfg, st }

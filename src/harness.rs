@@ -547,10 +547,16 @@ pub fn run(
         // Split accumulation: a provider reporting either side opts in;
         // missing sides keep the pair partial-but-accumulated (Some only
         // once seen, so a split-less provider stays None).
-        if let Some(p) = resp.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()) {
+        if let Some(p) = resp
+            .pointer("/usage/prompt_tokens")
+            .and_then(|t| t.as_u64())
+        {
             prompt_tokens = Some(prompt_tokens.map_or(p, |acc: u64| acc.saturating_add(p)));
         }
-        if let Some(c) = resp.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()) {
+        if let Some(c) = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(|t| t.as_u64())
+        {
             completion_tokens = Some(completion_tokens.map_or(c, |acc: u64| acc.saturating_add(c)));
         }
         let (msg, calls) = match parse_message(&resp) {

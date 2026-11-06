@@ -66,6 +66,7 @@ fn fixture(dir: &Path) -> (config::Config, Settings) {
         agent_timeout_s: 60,
         agent_stall_s: 0,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     (cfg, st)

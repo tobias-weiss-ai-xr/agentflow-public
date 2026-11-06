@@ -113,7 +113,7 @@ THEN loading succeeds with exactly one warning naming that worker, and a worker 
 
 ### Requirement: Environment overrides
 
-`af` SHALL honor the environment variables `AF_REPO_DIR`, `AF_STATE_DIR`, `AF_MAX_PARALLEL`, `AF_BRANCH_PREFIX`, `AF_POLL`, `AF_GATE_ENV` with documented defaults, matching taskfleet semantics for drop-in compatibility. For every such variable af SHALL read the `AF_*` name first and, only when it is unset, fall back to the legacy `TF_*` name; when a legacy `TF_*` name is consulted af SHALL print a deprecation notice to stderr (`warning: TF_X is deprecated; use AF_X instead`) at most once per legacy name per process.
+`af` SHALL honor the environment variables `AF_REPO_DIR`, `AF_STATE_DIR`, `AF_MAX_PARALLEL`, `AF_BRANCH_PREFIX`, `AF_POLL`, `AF_GATE_ENV` with documented defaults, matching taskfleet semantics for drop-in compatibility. `AF_MAX_TOKENS` (campaign token spend ceiling, `0` = unlimited) SHALL be honored the same way, defaulting to `0`. For every such variable af SHALL read the `AF_*` name first and, only when it is unset, fall back to the legacy `TF_*` name; when a legacy `TF_*` name is consulted af SHALL print a deprecation notice to stderr (`warning: TF_X is deprecated; use AF_X instead`) at most once per legacy name per process.
 
 #### Scenario: overrides applied
 
@@ -200,6 +200,13 @@ above.
   `readonly: true` combined with an `accept` gate — a gate on a read-only task
   is contradictory — with a hard error naming the task. Absent = normal task
   behavior unchanged.
+- `max_tokens` — an optional non-negative integer (default `0` = no per-task
+  cap). A per-task token ceiling: before each dispatch, when the task's own
+  receipts already total at least its `max_tokens`, the task SHALL be set to
+  `failed` with a reason naming the spend and the cap, and no further agent
+  SHALL be dispatched for it. It composes with the campaign ceiling
+  (`AF_MAX_TOKENS`) and with `max_turns`/`max_attempts`. Absent or `0` =
+  no per-task cap.
 
 #### Scenario: per-task max_turns parses and validates
 
@@ -208,12 +215,17 @@ THEN it loads successfully.
 WHEN a task declares `max_turns: 0`
 THEN loading fails naming the task.
 
-#### Scenario: readonly parses and validates
+#### Scenario: per-task max_tokens parses
 
-WHEN a task declares `readonly: true` and no `accept`
-THEN it loads without the usual no-gate warning.
-WHEN a task declares `readonly: true` and an `accept` command
-THEN loading fails naming the task.
+WHEN a task declares `max_tokens: 5000`
+THEN it loads with that cap.
+WHEN a task omits `max_tokens`
+THEN it loads with no per-task cap (`None`).
+
+#### Scenario: per-task max_tokens zero is a no-op
+
+WHEN a task declares `max_tokens: 0`
+THEN it loads with no per-task cap (0 is a no-op).
 
 ### Requirement: Gate/scope mismatch warning at validate time
 

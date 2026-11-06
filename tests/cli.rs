@@ -95,6 +95,7 @@ impl Cli {
             agent_timeout_s: 60,
             agent_stall_s: 0,
             max_wall_clock_s: 0,
+            max_tokens: 0,
             sandbox_cmd: vec![],
         };
         (cfg, st)
@@ -2411,6 +2412,8 @@ fn settings_from_env_honors_af_overrides_and_defaults() {
         "AF_BRANCH_PREFIX",
         "AF_POLL",
         "AF_GATE_ENV",
+        "AF_MAX_WALL_CLOCK_S",
+        "AF_MAX_TOKENS",
         "TF_REPO_DIR",
         "TF_STATE_DIR",
         "TF_MAX_PARALLEL",
@@ -2425,6 +2428,8 @@ fn settings_from_env_honors_af_overrides_and_defaults() {
     assert_eq!(st.poll_secs, 15, "default poll interval");
     assert_eq!(st.branch_prefix, "tf", "default branch prefix");
     assert_eq!(st.max_parallel, 0, "0 = one per enabled worker");
+    assert_eq!(st.max_wall_clock_s, 0, "0 = unlimited wall-clock (default)");
+    assert_eq!(st.max_tokens, 0, "0 = unlimited tokens (default)");
 
     // Overrides applied.
     std::env::set_var("AF_REPO_DIR", "/tmp/ov-repo");
@@ -2433,6 +2438,8 @@ fn settings_from_env_honors_af_overrides_and_defaults() {
     std::env::set_var("AF_BRANCH_PREFIX", "ov");
     std::env::set_var("AF_POLL", "5");
     std::env::set_var("AF_GATE_ENV", "K=1");
+    std::env::set_var("AF_MAX_WALL_CLOCK_S", "3600");
+    std::env::set_var("AF_MAX_TOKENS", "500000");
     let st = Settings::from_env();
     assert_eq!(st.repo_dir, std::path::PathBuf::from("/tmp/ov-repo"));
     assert_eq!(st.state_dir, std::path::PathBuf::from("/tmp/ov-state"));
@@ -2440,6 +2447,8 @@ fn settings_from_env_honors_af_overrides_and_defaults() {
     assert_eq!(st.branch_prefix, "ov");
     assert_eq!(st.poll_secs, 5);
     assert_eq!(st.gate_env, vec![("K".to_string(), "1".to_string())]);
+    assert_eq!(st.max_wall_clock_s, 3600);
+    assert_eq!(st.max_tokens, 500000);
 
     // Legacy TF_* names still work when the AF_* twin is absent.
     std::env::remove_var("AF_POLL");
@@ -2462,6 +2471,8 @@ fn settings_from_env_honors_af_overrides_and_defaults() {
         "AF_BRANCH_PREFIX",
         "AF_POLL",
         "AF_GATE_ENV",
+        "AF_MAX_WALL_CLOCK_S",
+        "AF_MAX_TOKENS",
         "TF_REPO_DIR",
         "TF_STATE_DIR",
         "TF_MAX_PARALLEL",

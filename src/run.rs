@@ -635,9 +635,11 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
     let mut router = Router::from_receipts(&verdicts);
     // Performance cache: avoid re-reading receipts on every loop iteration.
     // The receipts only change when a new attempt completes (handled by reap),
-    // so we update `all_receipts_cache` and `measured_cache` there.
+    // so we update `all_receipts_cache`, `measured_cache` (wall-clock), and
+    // `tokens_cache` (token spend) there.
     let mut all_receipts_cache = all_receipts;
     let mut measured_cache = consumed_wall_clock_s(&all_receipts_cache, &in_scope);
+    let mut tokens_cache = consumed_tokens(&all_receipts_cache, &in_scope);
     loop {
         // Reap finished tasks — BLOCKING while attempts are in flight, so
         // a completion wakes the dispatcher immediately instead of it
@@ -673,6 +675,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
         if all_receipts_fresh.len() != receipt_count_before {
             all_receipts_cache = all_receipts_fresh;
             measured_cache = consumed_wall_clock_s(&all_receipts_cache, &in_scope);
+            tokens_cache = consumed_tokens(&all_receipts_cache, &in_scope);
         }
 
         // Hot-reload (feedback §6.2): plan this round against the CURRENT
@@ -711,15 +714,17 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
             println!("{}", board_of(&cfg, &status));
             return 0;
         }
-        // Cost ceiling (r8-budget-cap): use cached receipts for performance.
-        // Updated incrementally by reap() when new receipts are appended.
-        // 0 disables the ceiling entirely — the legacy behaviour.
+        // Cost ceilings (r8-budget-cap + token-budget-ceiling): use cached
+        // receipts for performance. Updated incrementally by reap() when new
+        // receipts are appended. 0 disables either ceiling entirely.
         let measured = if st.max_wall_clock_s == 0 {
             0.0
         } else {
             measured_cache
         };
-        let over_budget = wall_clock_budget_exhausted(st, measured);
+        let measured_tokens = if st.max_tokens == 0 { 0 } else { tokens_cache };
+        let over_budget = wall_clock_budget_exhausted(st, measured)
+            || token_budget_exhausted(st, measured_tokens);
 
         let running_ids: Vec<String> = running.lock().unwrap().keys().cloned().collect();
         if running_ids.is_empty() {
@@ -744,10 +749,17 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                         )
                     })
                     .count();
-                eprintln!(
-                    "wall-clock budget exhausted: spent {measured:.1}s of {}s cap; {not_started} in-scope task(s) not started",
-                    st.max_wall_clock_s
-                );
+                if token_budget_exhausted(st, measured_tokens) {
+                    eprintln!(
+                        "token budget exhausted: spent {measured_tokens} of {} tokens cap; {not_started} in-scope task(s) not started",
+                        st.max_tokens
+                    );
+                } else {
+                    eprintln!(
+                        "wall-clock budget exhausted: spent {measured:.1}s of {}s cap; {not_started} in-scope task(s) not started",
+                        st.max_wall_clock_s
+                    );
+                }
                 return 3;
             }
             if ready_in_scope == 0 {
@@ -794,6 +806,30 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                     )
                 {
                     continue;
+                }
+                // Per-task token ceiling: a task whose receipts already total
+                // at least its `max_tokens` is not dispatched — it is set to
+                // `failed` with a reason, exactly as `max_attempts` exhausts
+                // a task. 0 or absent = no per-task cap. This is a dispatch
+                // gate, not a mid-attempt kill (the provider reports usage
+                // after the round-trip). Composes with the campaign ceiling.
+                if let Some(cap) = t.max_tokens {
+                    if cap > 0 {
+                        let spent = consumed_tokens_for_task(&all_receipts_cache, &t.id);
+                        if spent >= cap {
+                            let s = status.entry(t.id.clone()).or_default();
+                            s.state = TaskState::Failed;
+                            s.last_error = Some(format!(
+                                "token budget exhausted: spent {spent} of {cap} max_tokens"
+                            ));
+                            let _ = store.save(&status);
+                            eprintln!(
+                                "  \u{2298} {} token budget exhausted: {spent}/{cap} tokens",
+                                t.id
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let worker =
                     match pick_worker(&cfg, &worker_busy, &router, opts.worker_filter.as_deref()) {
@@ -1614,8 +1650,9 @@ pub fn dry_run(cfg: &Config, st: &Settings) -> i32 {
             }
         );
     }
-    // Budget (r8-budget-cap): surface an exhausted ceiling in the plan too —
-    // dry-run still creates nothing and still exits 0.
+    // Budget (r8-budget-cap + token-budget-ceiling): surface an exhausted
+    // ceiling in the plan too — dry-run still creates nothing and still
+    // exits 0.
     if st.max_wall_clock_s > 0 {
         let in_scope: Vec<&crate::config::Task> = cfg.tasks.iter().collect();
         let measured = consumed_wall_clock_s(&store.load_receipts(), &in_scope);
@@ -1623,6 +1660,16 @@ pub fn dry_run(cfg: &Config, st: &Settings) -> i32 {
             println!(
                 "  BUDGET: spent {measured:.1}s of {}s cap (AF_MAX_WALL_CLOCK_S) — a run would stop before dispatching new attempts",
                 st.max_wall_clock_s
+            );
+        }
+    }
+    if st.max_tokens > 0 {
+        let in_scope: Vec<&crate::config::Task> = cfg.tasks.iter().collect();
+        let spent = consumed_tokens(&store.load_receipts(), &in_scope);
+        if token_budget_exhausted(st, spent) {
+            println!(
+                "  BUDGET: spent {spent} of {} tokens cap (AF_MAX_TOKENS) — a run would stop before dispatching new attempts",
+                st.max_tokens
             );
         }
     }
@@ -1862,6 +1909,36 @@ fn consumed_wall_clock_s(receipts: &[Receipt], in_scope: &[&crate::config::Task]
 /// `max_wall_clock_s == 0` disables the ceiling (unlimited, legacy).
 fn wall_clock_budget_exhausted(st: &Settings, measured: f64) -> bool {
     st.max_wall_clock_s > 0 && measured >= st.max_wall_clock_s as f64
+}
+
+/// Total tokens spent on in-scope tasks, from the same receipt window the
+/// wall-clock ceiling and `af cost` use. A receipt with `tokens: None`
+/// (interrupted, or a CLI worker without token capture) contributes 0 —
+/// `filter_map` handles this naturally. A `failed` attempt that burned tokens
+/// contributes them, exactly as the wall-clock ceiling counts a failed
+/// attempt's `wall_clock_s`.
+fn consumed_tokens(receipts: &[Receipt], in_scope: &[&crate::config::Task]) -> u64 {
+    select_receipts(receipts, &CostFilter::default())
+        .into_iter()
+        .filter(|r| in_scope.iter().any(|t| t.id == r.task))
+        .filter_map(|r| r.tokens)
+        .sum()
+}
+
+/// Is the campaign's measured token spend at or above its ceiling?
+/// `max_tokens == 0` disables the ceiling (unlimited, the default).
+fn token_budget_exhausted(st: &Settings, consumed: u64) -> bool {
+    st.max_tokens > 0 && consumed >= st.max_tokens
+}
+
+/// Total tokens spent on ONE task's receipts (for the per-task ceiling).
+/// Same window/filter as the campaign ceiling, scoped to a single task.
+fn consumed_tokens_for_task(receipts: &[Receipt], task_id: &str) -> u64 {
+    select_receipts(receipts, &CostFilter::default())
+        .into_iter()
+        .filter(|r| r.task == task_id)
+        .filter_map(|r| r.tokens)
+        .sum()
 }
 
 /// Stable grouping key for a failed attempt's CAUSE: the text before the
@@ -2742,6 +2819,7 @@ mod tests {
             agent_timeout_s: 3600,
             agent_stall_s: 0,
             max_wall_clock_s: 0,
+            max_tokens: 0,
             sandbox_cmd: vec![],
         }
     }
@@ -2893,9 +2971,9 @@ mod tests {
                 model: "m".into(),
                 wall_clock_s: 1.0,
                 tokens: None,
-            turns: None,
-            prompt_tokens: None,
-            completion_tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
                 ts: 1,
                 outcome: "verified".into(),
                 error: None,
@@ -3312,9 +3390,9 @@ mod tests {
                 model: "m".into(),
                 wall_clock_s: wall,
                 tokens: None,
-            turns: None,
-            prompt_tokens: None,
-            completion_tokens: None,
+                turns: None,
+                prompt_tokens: None,
+                completion_tokens: None,
                 ts,
                 outcome: outcome.into(),
                 error: None,

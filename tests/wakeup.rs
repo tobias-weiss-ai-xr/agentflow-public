@@ -114,6 +114,7 @@ fn a_finished_task_wakes_the_dispatcher_immediately() {
         agent_timeout_s: 60,
         agent_stall_s: 0,
         max_wall_clock_s: 0,
+        max_tokens: 0,
         sandbox_cmd: vec![],
     };
     // Per-task artifacts: the stub knob must ride the sandbox env

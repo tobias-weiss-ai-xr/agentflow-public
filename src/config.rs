@@ -106,6 +106,16 @@ pub struct Task {
     /// workers. Absent = no per-task override.
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// Per-task token ceiling: the sum of `tokens` over this task's receipts
+    /// is checked before each dispatch; when it reaches this cap the task is
+    /// set to `failed` with a reason naming the spend and the cap, and no
+    /// further agent is dispatched for it. 0 or absent = no per-task cap.
+    /// The ceiling is a dispatch gate, not a mid-attempt kill: the provider
+    /// reports usage after the round-trip, so a mid-attempt kill would need a
+    /// streaming counter (a separate feature). Composes with the campaign
+    /// ceiling (`AF_MAX_TOKENS`) and with `max_turns`/`max_attempts`.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
     /// Investigation-only task: the builtin harness rejects every `write` and
     /// `edit` tool call, and the attempt completes when the agent stops
     /// normally — no acceptance gate, no merge. Validation rejects combining
@@ -369,6 +379,11 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
         if t.max_turns == Some(0) {
             return Err(format!("task '{}': max_turns must be >= 1", t.id));
         }
+        // Per-task token ceiling: 0 is a no-op (absent), any positive value
+        // is a cap. A negative value is nonsense (u64 cannot be negative, but
+        // a JSON like -1 would fail to deserialize — so this guard is for the
+        // explicit zero-means-unlimited convention, not a negative check).
+        // No validation error: 0 and absent are both "no cap".
         // Verify checks run before the readonly+accept check so that a
         // verify+readonly task reports "verify task cannot be readonly"
         // (rather than the readonly+accept message). A verify task always
@@ -617,6 +632,15 @@ pub struct Settings {
     /// exits 3 (stopped early) instead of looping. The receipts are the
     /// ledger, so the ceiling survives restarts and composes across runs.
     pub max_wall_clock_s: u64,
+    /// Campaign token spend ceiling (`AF_MAX_TOKENS`), in tokens. **0 =
+    /// unlimited** (the default). Any non-zero value stops NEW dispatches
+    /// once the receipts for the in-scope tasks total at least this many
+    /// tokens — attempts already in flight still finish — and the run exits
+    /// 3. The ceiling reads the same `tokens` field the receipt ledger
+    /// already carries and `af cost` already reports, so the enforced number
+    /// is the number the operator sees. Composes with `max_wall_clock_s`
+    /// (either ceiling can stop dispatch) and with a per-task `max_tokens`.
+    pub max_tokens: u64,
     /// Whitespace-split command prefix wrapped around the agent argv
     /// (`AF_SANDBOX_CMD`, e.g. "firejail --net=none"). Empty = no wrapper.
     pub sandbox_cmd: Vec<String>,
@@ -686,6 +710,7 @@ impl Settings {
             agent_stall_s: env_or_int("AF_AGENT_STALL_S", 0),
             agent_max_turns: env_or_int("AF_AGENT_MAX_TURNS", 0) as u32,
             max_wall_clock_s: env_or_int("AF_MAX_WALL_CLOCK_S", 0),
+            max_tokens: env_or_int("AF_MAX_TOKENS", 0),
             sandbox_cmd: env_or("AF_SANDBOX_CMD", "")
                 .split_whitespace()
                 .map(str::to_string)
@@ -1034,6 +1059,48 @@ mod tests {
         );
         let e = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap_err();
         assert!(e.contains("max_turns must be >= 1"), "{e}");
+    }
+
+    #[test]
+    // spec: config/per-task-turn-cap-and-readonly-task-fields#per-task-max-tokens-parses
+    fn task_max_tokens_parses_and_defaults_to_none() {
+        let d = tmpdir("cfg-maxtokens");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","scope":["a.txt"],"accept":"true","max_tokens":5000},
+                {"id":"B","title":"y","scope":["b.txt"],"accept":"true"}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let cfg = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        let a = cfg.tasks.iter().find(|t| t.id == "A").unwrap();
+        let b = cfg.tasks.iter().find(|t| t.id == "B").unwrap();
+        assert_eq!(a.max_tokens, Some(5000));
+        assert_eq!(b.max_tokens, None, "absent max_tokens stays None");
+    }
+
+    #[test]
+    // spec: config/per-task-turn-cap-and-readonly-task-fields#per-task-max-tokens-zero-is-a-no-op
+    fn task_max_tokens_zero_is_no_op() {
+        let d = tmpdir("cfg-maxtokens0");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","scope":["a.txt"],"accept":"true","max_tokens":0}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let cfg = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        let a = cfg.tasks.iter().find(|t| t.id == "A").unwrap();
+        assert_eq!(a.max_tokens, Some(0), "explicit 0 loads as Some(0)");
+        assert_eq!(cfg.workers.len(), 1);
     }
 
     #[test]
