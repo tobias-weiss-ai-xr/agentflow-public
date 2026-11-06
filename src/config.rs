@@ -191,6 +191,15 @@ pub struct Worker {
     /// to `defaults`.
     #[serde(default)]
     pub max_attempts: Option<u32>,
+    /// Per-worker concurrency cap (§2): how many tasks a single worker may
+    /// run simultaneously. 0 (the default) reproduces the legacy one-at-a-time
+    /// behaviour (a worker is either busy or free). A value > 1 allows a
+    /// single worker to handle several tasks in parallel, which is useful
+    /// when an operator wants to increase throughput on a cheap worker, but
+    /// increases burst traffic to its endpoint. Leave at 0 for the safe
+    /// default.
+    #[serde(default)]
+    pub max_in_flight: u32,
 }
 
 impl Default for Worker {
@@ -210,6 +219,7 @@ impl Default for Worker {
             price_per_mtok_usd: None,
             max_turns: None,
             max_attempts: None,
+            max_in_flight: 0,
         }
     }
 }
@@ -410,6 +420,23 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
                 "worker '{}': max_attempts {} lives on the worker, but the retry budget is read from the top-level 'defaults' block — af ignored it (running at defaults.max_attempts). Move it: {{ \"defaults\": {{ \"max_attempts\": {} }} }}",
                 w.name, ma, ma
             ));
+        }
+    }
+    // A worker `command` template that does not contain `{prompt}` can never
+    // receive the prompt file path, so the agent runs without its task
+    // (Go-port legacy configs hit this). Warn instead of silently running a
+    // prompt-less agent.
+    for w in workers {
+        if w.cli == "builtin" {
+            continue;
+        }
+        if let Some(tpl) = &w.command {
+            if !tpl.contains("{prompt}") {
+                warnings.push(format!(
+                    "worker '{}': command template does not contain '{{prompt}}' — the prompt file path will never be substituted; agent will run without its task. Use the af CLI contract: `--provider/--model/-p @file` (see scripts/af-opencode.sh) or include '{{prompt}}' in the template.",
+                    w.name
+                ));
+            }
         }
     }
     // Gate/scope mismatch (World-Office lesson, 2026-10-14): a task scoped to

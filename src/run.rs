@@ -57,7 +57,8 @@ pub struct RunOptions {
 fn reap(
     rx: &mpsc::Receiver<(String, String, Outcome, f64)>,
     running: &Arc<Mutex<HashMap<String, ()>>>,
-    worker_busy: &Arc<Mutex<HashMap<String, bool>>>,
+    worker_busy: &Arc<Mutex<HashMap<String, usize>>>,
+    worker_backoff: &Arc<Mutex<HashMap<String, std::time::Instant>>>,
     router: &mut Router,
     status: &mut HashMap<String, TaskStatus>,
     store: &Store,
@@ -73,19 +74,36 @@ fn reap(
         .chain(std::iter::from_fn(|| rx.try_recv().ok()))
     {
         running.lock().unwrap().remove(&id);
-        worker_busy
-            .lock()
-            .unwrap()
-            .insert(worker_name.clone(), false);
-        // Every reaped attempt is a verdict (merged/failed) WITH its
-        // measured wall-clock — the same span `execute_task` records on
-        // the receipt — so the live duration stat matches a replay from
-        // receipts.
-        router.record(
-            &worker_name,
-            matches!(outcome, Outcome::Merged | Outcome::Verified),
-            Some(wall_s),
-        );
+        let mut wb = worker_busy.lock().unwrap();
+        if let Some(c) = wb.get_mut(&worker_name) {
+            if *c > 0 {
+                *c -= 1;
+            }
+            if *c == 0 {
+                wb.remove(&worker_name);
+            }
+        }
+        // Every reaped attempt that is a WORKER VERDICT (merged/failed/verified)
+        // is recorded WITH its measured wall-clock — the same span `execute_task`
+        // records on the receipt — so the live duration stat matches a replay
+        // from receipts. Infra failures (provider/transport outages) are
+        // excluded: `counts_as_verdict()` is false for `OUTCOME_INFRA`, so an
+        // outage never dents the worker's UCB1 trust (nor counts in the
+        // denominator).
+        if !matches!(outcome, Outcome::Infra(_)) {
+            router.record(
+                &worker_name,
+                matches!(outcome, Outcome::Merged | Outcome::Verified),
+                Some(wall_s),
+            );
+        } else {
+            // Backoff: infra failure (provider/transport) → skip this worker
+            // for 30s to let the proxy recover.
+            worker_backoff.lock().unwrap().insert(
+                worker_name.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
+        }
         // Journal reconciliation: attempt threads persist phase boundaries
         // via load-modify-save (see `record_phase`), so this in-memory map
         // has not seen them. Copy every entry's freshest persisted boundary
@@ -110,7 +128,7 @@ fn reap(
                 s.last_error = None;
                 println!("  ✓ {id} verified (attempt {})", s.attempts);
             }
-            Outcome::Failed(err) => {
+            Outcome::Failed(err) | Outcome::Infra(err) => {
                 s.last_error = Some(err.clone());
                 if s.attempts >= max_attempts {
                     s.state = TaskState::Failed;
@@ -131,11 +149,14 @@ fn reap(
 /// UCB1 selection among the free, enabled, filter-matching workers.
 pub fn pick_worker<'a>(
     cfg: &'a Config,
-    busy: &Mutex<HashMap<String, bool>>,
+    busy: &Mutex<HashMap<String, usize>>,
+    backoff: &Mutex<HashMap<String, std::time::Instant>>,
     router: &Router,
     filter: Option<&str>,
 ) -> Option<&'a crate::config::Worker> {
     let busy = busy.lock().unwrap();
+    let backoff = backoff.lock().unwrap();
+    let now = std::time::Instant::now();
     let eligible: Vec<&crate::config::Worker> = cfg
         .workers
         .iter()
@@ -144,7 +165,18 @@ pub fn pick_worker<'a>(
             Some(f) => w.name == f,
             None => true,
         })
-        .filter(|w| !busy.get(&w.name).copied().unwrap_or(false))
+        .filter(|w| {
+            let cap = if w.max_in_flight == 0 {
+                1
+            } else {
+                w.max_in_flight as usize
+            };
+            busy.get(&w.name).copied().unwrap_or(0) < cap
+        })
+        .filter(|w| {
+            // Backoff: skip workers that recently had an infra failure.
+            !matches!(backoff.get(&w.name), Some(until) if *until > now)
+        })
         .collect();
     router.pick(eligible)
 }
@@ -215,6 +247,7 @@ fn append_recovered_receipt(store: &Store, st: &Settings, task_id: &str, branch:
         error: None,
         cost_micros: None,
         contracts: None,
+        kind: None,
     });
 }
 
@@ -545,7 +578,9 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
 
     let (tx, rx) = mpsc::channel::<(String, String, Outcome, f64)>();
     let merge_locks = worktree::MergeLocks::new();
-    let worker_busy: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    let worker_busy: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let worker_backoff: Arc<Mutex<HashMap<String, std::time::Instant>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let running: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let enabled = cfg.workers.iter().filter(|w| w.enabled).count();
@@ -661,6 +696,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
             &rx,
             &running,
             &worker_busy,
+            &worker_backoff,
             &mut router,
             &mut status,
             &store,
@@ -795,11 +831,16 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                 {
                     continue;
                 }
-                let worker =
-                    match pick_worker(&cfg, &worker_busy, &router, opts.worker_filter.as_deref()) {
-                        Some(w) => w.clone(),
-                        None => break, // no free worker this round
-                    };
+                let worker = match pick_worker(
+                    &cfg,
+                    &worker_busy,
+                    &worker_backoff,
+                    &router,
+                    opts.worker_filter.as_deref(),
+                ) {
+                    Some(w) => w.clone(),
+                    None => break, // no free worker this round
+                };
                 // Mark Running + persist BEFORE spawning (crash-safety).
                 let attempt = {
                     let s = status.entry(t.id.clone()).or_default();
@@ -819,10 +860,11 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                 };
                 let _ = store.save(&status);
 
-                worker_busy
+                *worker_busy
                     .lock()
                     .unwrap()
-                    .insert(worker.name.clone(), true);
+                    .entry(worker.name.clone())
+                    .or_insert(0) += 1;
                 running.lock().unwrap().insert(t.id.clone(), ());
                 let log_path = log_dir.join(format!("{}.log", t.id));
                 let tx2 = tx.clone();
@@ -865,7 +907,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                     if pace_retries
                         && retry_delay_s > 0
                         && attempt < max_attempts
-                        && matches!(out, Outcome::Failed(_))
+                        && matches!(out, Outcome::Failed(_) | Outcome::Infra(_))
                     {
                         // Observable: one clear line naming the task and
                         // the seconds, in the run log and the task's own
@@ -893,6 +935,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                         &rx,
                         &running,
                         &worker_busy,
+                        &worker_backoff,
                         &mut router,
                         &mut status,
                         &store,
@@ -1080,6 +1123,7 @@ fn finish_resume_verify(
         error: None,
         cost_micros: None,
         contracts: None,
+        kind: None,
     });
     true
 }
@@ -1323,6 +1367,7 @@ fn heal_stale_attempt(
             error: Some(error),
             cost_micros: None,
             contracts: None,
+            kind: None,
         });
         // RerunAgent, or a resume that lost its artifacts (always safe):
         // apply the budget to the now-counted attempt — Ready for a fresh
@@ -1721,6 +1766,12 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
             .iter()
             .rev()
             .find(|r| r.task == t.id && r.counts_as_verdict());
+        // Latest receipt of any kind (including infra failures, which are
+        // terminal but not verdicts) — used to surface the infra_fail flag.
+        let latest_any = receipts.iter().rev().find(|r| r.task == t.id);
+        let infra_fail = latest_any
+            .map(|r| r.kind.as_deref() == Some("infra"))
+            .unwrap_or(false);
         let verdict = latest.map(|r| r.outcome.as_str()).unwrap_or("none");
         let contracts = latest
             .and_then(|r| r.contracts.as_ref())
@@ -1740,6 +1791,7 @@ pub fn status_json(cfg: &Config, st: &Settings) -> String {
                 "verify": t.verify,
                 "verdict": verdict,
                 "contracts": contracts,
+                "infra_fail": infra_fail,
             }),
         );
     }
@@ -2904,6 +2956,7 @@ mod tests {
                     contract: "C-M1".into(),
                     verdict: "pass".into(),
                 }]),
+                kind: None,
             })
             .unwrap();
 
@@ -3172,6 +3225,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         };
         store.append_receipt(&receipt("A", 10.0, "merged")).unwrap();
         store.append_receipt(&receipt("A", 5.5, "failed")).unwrap();
@@ -3221,6 +3275,7 @@ mod tests {
             error: error.map(str::to_string),
             cost_micros: None,
             contracts: None,
+            kind: None,
         };
         // No error on the receipt → the literal key.
         assert_eq!(waste_cause(&r(None)), "unknown");
@@ -3320,6 +3375,7 @@ mod tests {
                 error: None,
                 cost_micros: None,
                 contracts: None,
+                kind: None,
             };
         // A: a failed retry then a merge on another worker. B: a same-ts
         // tie between attempts 1/2 — the greater attempt must win. C: two
@@ -3437,6 +3493,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         };
         store
             .append_receipt(&rcpt(1, 1_600_000_000, 100.0, "w1", "failed"))
@@ -3521,6 +3578,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         };
         // The mean over the verdict attempts, one decimal.
         let merged = rcpt(2.0, "merged");
@@ -3599,6 +3657,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         };
         // Every attempt Priced: the dollars SUM (500k + 250k at $2/Mtok).
         let r1 = rcpt("pw", Some(500_000));
@@ -3691,6 +3750,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
+            kind: None,
         };
         // One measured + one price-estimated attempt → named source plus
         // the estimate count, exactly the shape the report prints.
@@ -3747,6 +3807,7 @@ mod tests {
             error: None,
             cost_micros: cost,
             contracts: None,
+            kind: None,
         };
         // Measured beats declared: 500k tokens at $2/Mtok would estimate to
         // $1.0000, but the provider reported $0.0123 — the measurement wins

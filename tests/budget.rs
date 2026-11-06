@@ -145,6 +145,7 @@ fn seed_receipt(st: &Settings, task: &str, wall_clock_s: f64) {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         })
         .unwrap();
 }

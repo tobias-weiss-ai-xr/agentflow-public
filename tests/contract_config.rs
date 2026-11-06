@@ -357,16 +357,24 @@ fn disabled_worker_loads_but_is_not_selectable() {
     assert_eq!(enabled, vec!["on"]);
 
     let busy = Mutex::new(HashMap::new());
+    let backoff = Mutex::new(HashMap::new());
     let router = Router::default();
     // Unfiltered selection never returns the disabled worker.
-    assert_eq!(pick_worker(&cfg, &busy, &router, None).unwrap().name, "on");
+    assert_eq!(
+        pick_worker(&cfg, &busy, &backoff, &router, None)
+            .unwrap()
+            .name,
+        "on"
+    );
     // Naming it explicitly is still not enough.
     assert!(
-        pick_worker(&cfg, &busy, &router, Some("off")).is_none(),
+        pick_worker(&cfg, &busy, &backoff, &router, Some("off")).is_none(),
         "a disabled worker must never be selected, even when named"
     );
     assert_eq!(
-        pick_worker(&cfg, &busy, &router, Some("on")).unwrap().name,
+        pick_worker(&cfg, &busy, &backoff, &router, Some("on"))
+            .unwrap()
+            .name,
         "on"
     );
 }

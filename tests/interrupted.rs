@@ -125,6 +125,7 @@ fn receipt(task: &str, attempt: u32, worker: &str, outcome: &str, ts: u64) -> Re
         error: None,
         cost_micros: None,
         contracts: None,
+        kind: None,
     }
 }
 

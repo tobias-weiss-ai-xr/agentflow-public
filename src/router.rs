@@ -201,6 +201,7 @@ mod tests {
             error: None,
             cost_micros: None,
             contracts: None,
+            kind: None,
         }
     }
 

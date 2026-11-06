@@ -16,6 +16,7 @@ USAGE:
   af cost      [--task ID] [--last] [--since DATE|UNIX_TS]
   af clean     [--dry-run]
   af stop      signal the running orchestrator and request a drain
+  af resume    resume an interrupted run (alias for `af run`)
   af recover   --task ID [--attempt N] [--dry-run]
   af validate  [--worker NAME] [--tasks FILE] [--workers FILE]
   af --help | --version
@@ -44,6 +45,7 @@ struct Args {
     cmd: String,
     once: bool,
     dry_run: bool,
+    detach: bool,
     worker: Option<String>,
     task: Option<String>,
     poll: Option<u64>,
@@ -61,6 +63,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         cmd: String::new(),
         once: false,
         dry_run: false,
+        detach: false,
         worker: None,
         task: None,
         poll: None,
@@ -74,6 +77,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     let mut it = argv.iter();
     a.cmd = it.next().cloned().unwrap_or_default();
+    // `resume` is an alias for `run` (P1.8): an explicit "continue from
+    // where we left off" entry point. `af run` already resumes stale tasks
+    // via the startup heal, but `resume` makes the intent unambiguous.
+    if a.cmd == "resume" {
+        a.cmd = "run".to_string();
+    }
     // `api` collapses into its subcommand: "status" | "results"
     if a.cmd == "api" {
         let sub = it
@@ -85,6 +94,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--once" => a.once = true,
             "--dry-run" => a.dry_run = true,
+            "--detach" => a.detach = true,
             "--json" => a.json = true,
             "--worker" => a.worker = Some(it.next().ok_or("--worker needs a value")?.clone()),
             "--task" => a.task = Some(it.next().ok_or("--task needs a value")?.clone()),
@@ -172,6 +182,17 @@ fn install_crash_log(state_dir: &std::path::Path) {
 }
 
 fn load_cfg(args: &Args) -> Result<(config::Config, Settings), String> {
+    load_cfg_inner(args, false)
+}
+
+fn load_cfg_status(args: &Args) -> Result<(config::Config, Settings), String> {
+    load_cfg_inner(args, true)
+}
+
+fn load_cfg_inner(
+    args: &Args,
+    allow_missing_tasks: bool,
+) -> Result<(config::Config, Settings), String> {
     let st = Settings::from_env();
     let tasks = args
         .tasks_file
@@ -181,15 +202,57 @@ fn load_cfg(args: &Args) -> Result<(config::Config, Settings), String> {
         .workers_file
         .clone()
         .unwrap_or_else(|| st.workers_file.clone());
+    // §6.1: status does not need workers; if the workers file is missing,
+    // fall back to an empty worker list so the operator can still inspect.
+    let workers = if allow_missing_tasks && !workers.exists() {
+        let tmp = st.state_dir.join(".status-workers.json");
+        let _ = std::fs::write(
+            &tmp,
+            r#"{"defaults":{},"workers":[{"name":"_status","provider":"x","model":"x","enabled":true,"cli":"builtin","api_base":"http://localhost"}]}"#,
+        );
+        tmp
+    } else {
+        workers
+    };
     // Multi-repo (ADR-11): --repos > AF_REPOS_JSON > <tasks dir>/repos.json;
     // missing file = single-repo mode.
     let repos_override = args
         .repos_file
         .clone()
         .or_else(|| config::af_var("AF_REPOS_JSON").map(PathBuf::from));
-    let mut cfg = config::load_full(&tasks, &workers, repos_override)?;
+    // §6.1: `af status` should render from the state dir without requiring a
+    // tasks file. When the tasks file is missing, fall back to the task IDs
+    // recorded in run-state.json so the operator can inspect a running
+    // campaign without supplying AF_TASKS_JSON.
+    let cfg = if allow_missing_tasks && !tasks.exists() {
+        let rs_path = st.state_dir.join("run-state.json");
+        if let Ok(body) = std::fs::read_to_string(&rs_path) {
+            let map: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let mut ids: Vec<String> = map
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            ids.sort();
+            // Build a minimal config with empty workers (status doesn't need
+            // them) and one task per recorded id.
+            let tasks_json = serde_json::json!({
+                "tasks": ids.iter().map(|id| serde_json::json!({"id": id, "title": id})).collect::<Vec<_>>()
+            });
+            let tmp = st.state_dir.join(".status-tasks.json");
+            let _ = std::fs::write(&tmp, tasks_json.to_string());
+            let cfg = config::load_full(&tmp, &workers, repos_override)?;
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(st.state_dir.join(".status-workers.json"));
+            cfg
+        } else {
+            config::load_full(&tasks, &workers, repos_override)?
+        }
+    } else {
+        config::load_full(&tasks, &workers, repos_override)?
+    };
     let repo_warns = cfg.repo_warnings(&st.repo_dir);
-    cfg.warnings.extend(repo_warns); // printed by the common loop below
+    let mut cfg = cfg;
+    cfg.warnings.extend(repo_warns);
     for w in &cfg.warnings {
         eprintln!("warning: {w}");
     }
@@ -214,31 +277,102 @@ fn main() -> ExitCode {
         }
     };
 
-    let (cfg, st) = match load_cfg(&args) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("config error: {e}");
-            return ExitCode::from(2);
+    let is_status = args.cmd == "status" || args.cmd == "api-status";
+    let (cfg, st) = if is_status {
+        match load_cfg_status(&args) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("config error: {e}");
+                eprintln!(
+                    "  (state dir: {})",
+                    std::env::var("AF_STATE_DIR").unwrap_or_else(|_| "state".into())
+                );
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match load_cfg(&args) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("config error: {e}");
+                return ExitCode::from(2);
+            }
         }
     };
 
     let code = match args.cmd.as_str() {
         "run" => {
-            install_crash_log(&st.state_dir);
-            let opts = RunOptions {
-                once: args.once,
-                dry_run: args.dry_run,
-                worker_filter: args.worker.clone(),
-                task_filter: args.task.clone(),
-                poll_secs: args.poll,
-            };
-            run::run_loop(&cfg, &st, &opts)
+            if args.detach {
+                // Spawn a detached child process running `af run` (without
+                // --detach) with output redirected to a log file in the state
+                // dir. Print the pid + state dir so the caller can tail/join.
+                let log_path = st.state_dir.join("af-run.log");
+                let _ = std::fs::create_dir_all(&st.state_dir);
+                let log_file = std::fs::File::create(&log_path).ok();
+                let mut cmd = std::process::Command::new(
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("af")),
+                );
+                // Re-run without --detach, inheriting all other args/env.
+                cmd.args(std::env::args().skip(1).filter(|a| a != "--detach"));
+                if let Some(f) = log_file {
+                    use std::process::Stdio;
+                    cmd.stdout(Stdio::from(f.try_clone().unwrap()));
+                    cmd.stderr(Stdio::from(f));
+                    cmd.stdin(Stdio::null());
+                }
+                match cmd.spawn() {
+                    Ok(child) => {
+                        println!(
+                            "detached: pid {} (state dir: {}, log: {})",
+                            child.id(),
+                            st.state_dir.display(),
+                            log_path.display()
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("failed to detach: {e}");
+                        2
+                    }
+                }
+            } else {
+                install_crash_log(&st.state_dir);
+                let opts = RunOptions {
+                    once: args.once,
+                    dry_run: args.dry_run,
+                    worker_filter: args.worker.clone(),
+                    task_filter: args.task.clone(),
+                    poll_secs: args.poll,
+                };
+                run::run_loop(&cfg, &st, &opts)
+            }
         }
         "status" => {
             if args.json {
                 println!("{}", run::status_json(&cfg, &st));
             } else {
                 println!("{}", run::status_board(&cfg, &st));
+            }
+            0
+        }
+        "wait" => {
+            // Block until every task in the state dir reaches a terminal state
+            // (done or failed), polling every `--poll` seconds (default 15).
+            let poll = args.poll.unwrap_or(st.poll_secs).max(1);
+            loop {
+                let store = agentflow::state::Store::new(st.state_dir.clone());
+                let status = store.load();
+                let all_terminal = cfg.tasks.iter().all(|t| {
+                    status
+                        .get(&t.id)
+                        .map(|s| s.state.is_terminal())
+                        .unwrap_or(false)
+                });
+                if all_terminal || cfg.tasks.is_empty() {
+                    println!("{}", run::status_board(&cfg, &st));
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(poll));
             }
             0
         }
