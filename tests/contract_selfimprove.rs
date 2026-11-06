@@ -267,7 +267,11 @@ fn verify_task_gate_failure_is_failed_not_verified_and_never_merges() {
 
     // 1) The task ends Failed (NOT Done/verified) and the base is untouched.
     let st = Store::new(f.st.state_dir.clone()).load();
-    assert_eq!(st["A"].state, TaskState::Failed, "verify gate failure is failed");
+    assert_eq!(
+        st["A"].state,
+        TaskState::Failed,
+        "verify gate failure is failed"
+    );
     assert!(
         !f.repo.join("DONE.txt").exists(),
         "a failed verify gate never merges"
@@ -277,7 +281,10 @@ fn verify_task_gate_failure_is_failed_not_verified_and_never_merges() {
     //    (the gate failed before any accept_report.json could be parsed).
     let receipts = Store::new(f.st.state_dir.clone()).load_receipts();
     assert_eq!(receipts.len(), 1, "exactly one receipt: {receipts:?}");
-    assert_eq!(receipts[0].outcome, "failed", "gate failure is failed, not verified");
+    assert_eq!(
+        receipts[0].outcome, "failed",
+        "gate failure is failed, not verified"
+    );
     assert!(
         receipts[0].contracts.is_none(),
         "a failed gate writes no accept_report.json contracts"
@@ -286,8 +293,7 @@ fn verify_task_gate_failure_is_failed_not_verified_and_never_merges() {
     // 3) `af status --json` surfaces `verify: true` and `verdict: "failed"`
     //    (NOT "verified"), with an empty contracts array.
     let json = run::status_json(&f.cfg, &f.st);
-    let v: serde_json::Value =
-        serde_json::from_str(&json).expect("status --json is valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("status --json is valid JSON");
     let task = v
         .get("A")
         .and_then(|t| t.as_object())

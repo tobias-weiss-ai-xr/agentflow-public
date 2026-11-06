@@ -2672,11 +2672,13 @@ fn native_receipt_records_turns_and_token_split() {
     assert_eq!(r.turns, Some(2), "turn count survives to the receipt");
     assert_eq!(r.tokens, Some(30), "total accumulates across round-trips");
     assert_eq!(
-        r.prompt_tokens, Some(20),
+        r.prompt_tokens,
+        Some(20),
         "prompt split accumulates across round-trips"
     );
     assert_eq!(
-        r.completion_tokens, Some(10),
+        r.completion_tokens,
+        Some(10),
         "completion split accumulates across round-trips"
     );
 }
