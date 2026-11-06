@@ -145,6 +145,8 @@ fn archived_refs(repo: &Path, id: &str) -> Vec<String> {
 /// `verdict: "verified"` with the contracts map through `af status --json`.
 // spec: lifecycle/verify-tasks
 // spec: lifecycle/verify-tasks#verify-task-passes-and-archives
+// spec: lifecycle/verify-tasks#verify-task-s-acceptance-report-rides-the-receipt-sorted-by-key
+// spec: lifecycle/verify-tasks#status-json-surfaces-the-verify-verdict-and-contracts
 #[test]
 fn verify_task_emits_accept_report_reaches_verified_and_surfaces_contracts() {
     let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
@@ -311,7 +313,8 @@ fn verify_task_gate_failure_is_failed_not_verified_and_never_merges() {
 
 /// A NON-verify (merge) task whose gate writes accept_report.json surfaces
 /// the per-contract verdicts on the MERGED receipt (the merge path reads the
-/// report before cleanup). spec: lifecycle/verify-tasks#accept-report-rides-merge
+/// report before cleanup).
+// spec: lifecycle/verify-tasks#a-merged-task-s-gate-writes-an-acceptance-report
 #[test]
 fn merged_task_surfaces_accept_report_contracts() {
     let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
