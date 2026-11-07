@@ -18,6 +18,23 @@ The orchestrator stays thin (ADR-1): it drives `git` and an OpenAI-compatible
 agent CLI (`pi`, opencode, …) as subprocesses. It never talks to LLM
 providers directly.
 
+## Contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+  - [Environment variables (`AF_*`)](#environment-variables-af_)
+  - [Docker / Nix](#docker--nix)
+- [Versioning & releases](#versioning--releases)
+- [CLI](#cli)
+- [Task schema](#task-schema-configtasksjson)
+- [Worker schema](#worker-schema-configworkersjson)
+- [Sandboxing](#sandboxing)
+- [Agent CLI compatibility](#agent-cli-compatibility)
+- [Dogfooding / parallel workers](#dogfooding--parallel-workers)
+- [Testing](#testing)
+- [Coverage ratchet](#coverage-ratchet)
+- [License](#license)
+
 ## Features
 
 - **Parallel dispatch** — one worker per provider+model slot; concurrent tasks in isolated git worktrees
@@ -34,7 +51,7 @@ providers directly.
 - **Self-healing** — atomic JSON state; crash-safe resume; orphan worktree cleanup at startup, plus `af clean [--dry-run]` to sweep leftovers from crashed runs — including the archived `<branch>-rejected-*` refs, whose branches are kept while their task is still running
 - **Validated config** — `af validate` pre-flights tasks/workers (dependency cycles, duplicate ids, no enabled workers) without dispatching anything
 - **Observable** — status board (`af status [--json]`), live `attach`, per-task logs, wall-clock cost receipts
-- **Sound by construction** — spec → contract → test pyramid (340 tests, incl. E2E against a stub agent + scratch git repos; no network in CI)
+- **Sound by construction** — spec → contract → test pyramid (466 tests, incl. E2E against a stub agent + scratch git repos; no network in CI)
 
 ## Quick start
 
@@ -117,6 +134,22 @@ docker run --rm -v "$AF_REPO_DIR":/repo -v "$PWD/config":/config \
 With the entrypoint set, everything after the image name is af arguments
 (`docker run agentflow:0.1.0 --version`).
 
+## Versioning & releases
+
+`af --version` is derived from **git at build time**, so every build carries a
+unique, human-readable version with no manual version bumps in between:
+
+- `0.1.0+<commitcount>.<shorthash>` — `<commitcount>` is
+  `git rev-list --count HEAD` (monotonic), `<shorthash>` is
+  `git rev-parse --short=7 HEAD`. Two different builds never collide.
+- a `.dirty` suffix is appended when the tree has uncommitted changes at
+  build time.
+- Plain `X.Y.Z` is printed exactly when the build sits on a semver release
+  tag (`0.2.0` or `v0.2.0`) with a clean tree.
+- Outside a git checkout, `af --version` falls back to the plain crate
+  version. The build never fails because of git — versioning is metadata,
+  not a gate.
+
 ### Cutting a release
 
 ```sh
@@ -124,6 +157,35 @@ bash scripts/bump-version.sh 0.2.0   # bumps Cargo.toml, syncs README docker tag
                                      # builds, verifies `af --version`, commits + tags v0.2.0
 git push && git push --tags
 ```
+
+`bump-version.sh` takes care of the whole flow: bump the single source of
+truth (`Cargo.toml`), keep the README's docker tags in sync, build, smoke-test
+`af --version`, commit, and cut the `vX.Y.Z` tag. A build on that tag with a
+clean tree is exactly what prints the plain version.
+
+### Prebuilt binaries
+
+`scripts/dist/` builds the per-architecture release binaries in a bookworm
+container (glibc ≥ 2.32):
+
+```sh
+bash scripts/dist/build-x64.sh     # → /tmp/af-dist/af-linux-x64
+bash scripts/dist/build-arm64.sh   # → /tmp/af-dist/af-linux-arm64
+```
+
+Every GitHub release ships both tarballs plus a `SHA256SUMS` file
+(`af-linux-x64-vX.Y.Z.tar.gz`, `af-linux-arm64-vX.Y.Z.tar.gz`). To install the
+x86_64 build:
+
+```sh
+curl -sfL <release>/af-linux-x64-v0.1.0.tar.gz | tar xz
+sudo install -m0755 af /usr/local/bin/af
+af --version
+```
+
+> On hosts with glibc < 2.32 (e.g. Debian 11) the prebuilt binaries won't run —
+> install rustup, clone the repo, `cargo build --release`, and install
+> `target/release/af`.
 
 ## CLI
 
@@ -146,6 +208,8 @@ af cost [--task ID] [--last] [--since DATE|UNIX_TS]
 af clean [--dry-run]
 af recover --task ID [--attempt N] [--dry-run]
 af validate [--worker NAME]
+af stop
+af --version | -V      # prints the build version — see "Versioning & releases"
 ```
 
 ### Exit codes
@@ -208,7 +272,7 @@ receipts with `ts >=` the instant — `DATE` is `YYYY-MM-DD` (UTC midnight) or
 a bare unix timestamp, applied before `--last` so `--last --since D` is
 "the latest attempt per task since D". The window flags compose with each
 other and with `--task ID` (which narrows the table rows); the TOTAL line
-and the per-worker trust block are always computed over the selectedreceipts only.
+and the per-worker trust block are always computed over the selected receipts only.
 
 The table also carries a `TOKENS` column: it sums the `tokens` recorded on
 the selected receipts and shows `-` when they carry none, so a report over
@@ -339,7 +403,7 @@ to block the command: the readable history is still accounted for.
 | `manual` | Skip the acceptance gate (manual sign-off) |
 | `priority` | Tie-breaker when multiple tasks are ready. **Higher sorts first** (`CRITICAL`=20 > `HIGH`=10 > `MEDIUM`=0 > `LOW`=-10; numbers keep their value). The "P1 = highest priority" convention is the OPPOSITE of af's scale — declare p1-tasks as `"priority": 10` (or `"HIGH"`), not `1`. |
 | `gate_replay` | Whether the gate is replay-safe (default `true`); `false` = side effects |
-| `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 Often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
+| `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 is often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
 | `max_tokens` | Per-task token ceiling (default `0`/absent = no cap): before each dispatch af sums this task's receipts and, at/above the cap, marks the task `failed` with a reason naming the spend and the cap — no further agent runs for it. Composes with `AF_MAX_TOKENS`, `max_turns` and `max_attempts`. |
 | `readonly` | `true` = investigation-only: the builtin harness rejects `write`/`edit`, the attempt counts done on a normal agent stop (no gate, no merge) |
 | `cascade` | Ordered list of worker names tried CHEAPEST-FIRST across attempts: attempt 1 runs `cascade[0]`, attempt 2 escalates to `cascade[1]`, and so on — a hard task pays only the escalation it needs. When the attempt is past the cascade, the worker is busy, or it is disabled, af falls back to normal UCB1 routing. An explicit `--worker` pin overrides the cascade. The acceptance gate stays the sole arbiter (a cascade only changes WHO is dispatched). Validation rejects unknown worker names, duplicates, and an empty array. |
@@ -566,7 +630,7 @@ campaigns.
 ## Testing
 
 ```sh
-cargo test        # 340 tests: unit (scheduler DAG, contention, deadlock, state,
+cargo test        # 466 tests: unit (scheduler DAG, contention, deadlock, state,
                   # receipts, config validation, sandbox policy, multi-repo,
                   # UCB1 router, retry context, subprocess contracts) + E2E
                   # (fake agent + scratch git repos — no network)
@@ -578,8 +642,8 @@ See `docs/arc42/` for the architecture documentation (12 chapters), and
 ## Coverage ratchet
 
 CI enforces a **line-coverage floor** so coverage cannot silently rot. The
-floor lives in a single place — `.coverage-min` (currently `94%`, just below
-the measured 94.19% baseline) — and is checked by `scripts/coverage-gate.sh`, which runs
+floor lives in a single place — `.coverage-min` (currently `94%`, below the
+measured 95.50% baseline) — and is checked by `scripts/coverage-gate.sh`, which runs
 `cargo llvm-cov --workspace --fail-under-lines "$MIN"`. A drop below the floor
 fails the build.
 
