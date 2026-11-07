@@ -18,8 +18,35 @@ The orchestrator stays thin (ADR-1): it drives `git` and an OpenAI-compatible
 agent CLI (`pi`, opencode, …) as subprocesses. It never talks to LLM
 providers directly.
 
+## How it works
+
+`af run` runs a **campaign**: it reads a declarative task list and drives the
+agent CLI to completion per task — one worker per provider+model slot, each
+task in its own throwaway git worktree:
+
+1. **Prepare** — for every ready task, `af` creates a fresh worktree and
+   branch off the current base. Tasks whose `scope` globs overlap are never
+   dispatched at the same time.
+2. **Dispatch** — each task's prompt goes to a free worker, chosen by UCB1
+   trust routing. A failed attempt retries up to `max_attempts`, and the
+   retry prompt lists the earlier failures so the agent doesn't repeat them.
+3. **Verify** — the task's `accept` command must exit `0` inside the
+   worktree. Until it does, the branch is never merged.
+4. **Merge** — a passing gate merges the branch to the base; the outcome is
+   recorded in a receipt. Every other ending — stall, timeout, scope
+   violation, merge conflict, interruption — archives the branch as
+   `<branch>-rejected-<ts>` instead of destroying paid-for work.
+5. **Learn** — receipts drive the `af cost` ledger (spend, waste, per-worker
+   trust) and the router, so routing and budget reports improve across
+   campaigns.
+
+Tasks, workers, and repos are plain JSON — full references in the
+[Task schema](#task-schema-configtasksjson) and
+[Worker schema](#worker-schema-configworkersjson) sections below.
+
 ## Contents
 
+- [How it works](#how-it-works)
 - [Features](#features)
 - [Quick start](#quick-start)
   - [Environment variables (`AF_*`)](#environment-variables-af_)
@@ -55,12 +82,20 @@ providers directly.
 
 ## Quick start
 
+A five-minute walkthrough: build af, declare one task and one worker, and run
+a campaign. Full field references live in the
+[Task schema](#task-schema-configtasksjson) and
+[Worker schema](#worker-schema-configworkersjson) sections below.
+
+### 1. Build
+
 ```sh
 cargo build --release            # produces target/release/af
 ```
 
-Point one worker at any OpenAI-compatible endpoint using af's **builtin**
-harness (no external agent CLI needed), with one small task:
+### 2. Declare a task
+
+Start with one small task:
 
 ```json
 // config/tasks.json
@@ -72,6 +107,8 @@ harness (no external agent CLI needed), with one small task:
     "acceptance_prose": "src/hello.rs exists and declares pub fn hello()."
 } ] }
 ```
+
+### 3. Declare a worker
 
 ```json
 // config/workers.json
@@ -90,26 +127,63 @@ harness (no external agent CLI needed), with one small task:
 
 `api_base` is any OpenAI-compatible `/chat/completions` URL (z.ai, OpenRouter,
 a litellm proxy, a local vLLM…); `api_key_env` names the env var af reads the
-key from.
+key from. This worker uses `"cli": "builtin"` — af's native in-process harness
+— so no external agent CLI is installed on this machine.
+
+### 4. Point af at your repository
 
 ```sh
-export AF_REPO_DIR=/path/to/repo/being/modified
-export AF_STATE_DIR=state
-export ZAI_API_KEY=...            # whatever api_key_env names
+export AF_REPO_DIR=/path/to/repo/being/modified   # the repo tasks modify
+export AF_STATE_DIR=state                         # receipts + worktrees live here
+export ZAI_API_KEY=...                            # whatever api_key_env names
+```
 
-./target/release/af validate --tasks config/tasks.json --workers config/workers.json
-./target/release/af run --dry-run --tasks config/tasks.json --workers config/workers.json
-./target/release/af run           --tasks config/tasks.json --workers config/workers.json
-./target/release/af status && ./target/release/af cost
+### 5. Validate, preview, run
+
+```sh
+./target/release/af validate --tasks config/tasks.json --workers config/workers.json \
+    # pre-flight: config schema, dependency cycles, duplicate ids, no enabled workers — dispatches nothing
+
+./target/release/af run --dry-run --tasks config/tasks.json --workers config/workers.json \
+    # prints the plan and budget, creates nothing
+
+./target/release/af run --tasks config/tasks.json --workers config/workers.json \
+    # the campaign: worktree → agent → gate → merge, retries on failure
+```
+
+### 6. See what happened
+
+```sh
+./target/release/af status      # per-task board: done / running / failed
+./target/release/af cost        # the spend ledger, per-worker trust, waste
 ```
 
 ### Environment variables (`AF_*`)
 
-af reads its configuration from `AF_*` environment variables (`AF_REPO_DIR`,
-`AF_STATE_DIR`, `AF_MAX_PARALLEL`, `AF_BRANCH_PREFIX`, `AF_POLL`, `AF_GATE_ENV`,
-`AF_TASKS_JSON`, `AF_WORKERS_JSON`, `AF_REPOS_JSON`, `AF_AGENT_TIMEOUT_S`,
-`AF_AGENT_STALL_S`, `AF_AGENT_MAX_TURNS`, `AF_MAX_WALL_CLOCK_S`,
-`AF_SANDBOX_CMD`, `AF_AGENT_ENV_PASSTHROUGH`, `AF_NO_REUSE`, `AF_WORKTREE_ROOT`).
+af reads its configuration from `AF_*` environment variables. Defaults assume
+the config files and state dir live under the current directory.
+
+| Variable | Meaning (default) |
+|----------|-------------------|
+| `AF_REPO_DIR` | The repository tasks modify — base for branches, worktrees and merges (`.`) |
+| `AF_STATE_DIR` | Where receipts, the pid file and worktrees live (`state`) |
+| `AF_WORKTREE_ROOT` | Where task worktrees are created (`<state>/worktrees`) |
+| `AF_TASKS_JSON` | Tasks file (`config/tasks.json`) |
+| `AF_WORKERS_JSON` | Workers file (`config/workers.json`) |
+| `AF_REPOS_JSON` | Multi-repo map for campaigns spanning several repos (falls back to `<tasks dir>/repos.json`) |
+| `AF_MAX_PARALLEL` | Cap on concurrently running tasks (`0` = one per enabled worker) |
+| `AF_BRANCH_PREFIX` | Prefix for worktree branches (`tf`) |
+| `AF_POLL` | Poll interval of the run loop, in seconds (`15`) |
+| `AF_GATE_ENV` | Extra `K=V K2=V2 …` environment injected into `accept` gate commands (`""`) |
+| `AF_AGENT_TIMEOUT_S` | Per-attempt wall-clock limit before the agent is killed (`3600`) |
+| `AF_AGENT_STALL_S` | Kill the agent after N seconds without output (`0` = off) |
+| `AF_AGENT_MAX_TURNS` | Default turn cap for builtin workers (`0` → 32) |
+| `AF_MAX_WALL_CLOCK_S` | Campaign spend ceiling in seconds (`0` = unlimited — [details](#campaign-budget-af_max_wall_clock_s)) |
+| `AF_MAX_TOKENS` | Campaign spend ceiling in tokens (`0` = unlimited — [details](#campaign-token-budget-af_max_tokens)) |
+| `AF_SANDBOX_CMD` | Command prepended to the agent argv, e.g. `firejail --net=none` (`""`) |
+| `AF_AGENT_ENV_PASSTHROUGH` | Comma-separated env vars the agent child may additionally inherit |
+| `AF_NO_REUSE` | `1` disables reusing an archived branch that already satisfies a task's scope |
+
 The legacy `TF_*` names are still read as a fallback when the `AF_*` twin is
 unset, but are deprecated: using one prints a one-time
 `warning: TF_X is deprecated; use AF_X instead` notice on stderr. When both are
