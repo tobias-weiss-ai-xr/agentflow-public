@@ -46,14 +46,20 @@ cargo build
 # 3. Sync README docker examples.
 sed -i "s/agentflow:$OLD/agentflow:$NEW/g" README.md
 
-# 4. Smoke: the binary must report the new version.
+# 4. Smoke: the binary must report the new version (plain at a clean tagged
+# build, or with git-derived `+<count>.<sha>[.dirty]` build metadata — the
+# tree is dirty and untagged at this point in the script).
 VER=$("./target/debug/af" --version)
 echo "smoke: $VER"
-if [ "$VER" != "af $NEW" ]; then
-  echo "error: version mismatch ($VER != af $NEW); rolling back" >&2
-  git checkout -- Cargo.toml Cargo.lock README.md
-  exit 1
-fi
+case "$VER" in
+  "af $NEW" | "af $NEW"+*)
+    ;;
+  *)
+    echo "error: version mismatch ($VER != af $NEW); rolling back" >&2
+    git checkout -- Cargo.toml Cargo.lock README.md
+    exit 1
+    ;;
+esac
 
 # 5-7. Commit + tag.
 git add Cargo.toml Cargo.lock README.md
