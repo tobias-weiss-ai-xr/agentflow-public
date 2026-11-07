@@ -83,6 +83,8 @@ flowchart TD
   SCH --> CFG
 ```
 
+![Solution strategy](assets/04-strategy.png)
+
 ## 4.4 Feature evolution (14 dogfooding rounds)
 
 | Round | Theme | Key outcome |

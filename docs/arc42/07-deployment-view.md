@@ -16,6 +16,8 @@ flowchart LR
   AGENT -->|OpenAI-compatible API| P[LLM providers]
 ```
 
+![Deployment view](assets/07-deployment.png)
+
 ## 7.2 Deployment details
 
 | Item | Detail |

@@ -17,6 +17,8 @@ flowchart LR
   R[Target git repo] -->|worktrees / merges| G
 ```
 
+![System context](assets/03-context.png)
+
 ## 3.2 Business / Black-Box Context
 
 | Glossary term | Meaning in agentflow |
@@ -81,3 +83,5 @@ classDiagram
   Receipt --> Router
   Receipt --> Cost
 ```
+
+![Domain model](assets/03-domain-model.png)

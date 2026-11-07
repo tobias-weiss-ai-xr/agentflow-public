@@ -47,6 +47,8 @@ sequenceDiagram
   M-->>U: final status board (exit 0 = all done, 2 = deadlock, 3 = budget)
 ```
 
+![Runtime view — af run](assets/06-runtime.png)
+
 ## 6.2 Auto-reuse (round 13)
 
 Before dispatching an agent for a task, `af run` looks for an archived branch
