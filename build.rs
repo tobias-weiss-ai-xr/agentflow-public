@@ -25,13 +25,39 @@ fn main() {
     // Re-run this script when the git state may have changed (new commit,
     // checkout, `git add`), so a rebuild recomputes the version instead of
     // Cargo serving a cached one.
+    //
+    // We watch the HEAD and index FILES, not the `.git` DIRECTORY. Watching
+    // the whole directory made Cargo re-run this script on every invocation:
+    // git operations during the build (in particular the transient
+    // `.git/index.lock` created by our own `git status` call below) bump the
+    // directory's mtime, Cargo notices, re-runs the script, and the re-run
+    // rewrites this script's output file — so the crate was always considered
+    // dirty and rebuilt from scratch on every cargo build/test/clippy.
+    //
+    // Watching the specific files captures exactly the state that determines
+    // the version: a commit or checkout moves `.git/HEAD` (count + short sha
+    // change) and staging a change touches `.git/index` (dirty flag changes).
+    // Our own (read-only) `git status --porcelain` does not touch those files,
+    // so there is no churn. Accepted minor limitation: a plain edit to a
+    // tracked file touches neither `.git/HEAD` nor `.git/index`, so the
+    // `.dirty` suffix can go stale until the next `git add` or commit.
     let git_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".git");
     if git_path.is_dir() {
-        // Normal clone: watch the whole git dir.
-        println!("cargo:rerun-if-changed={}", git_path.display());
+        // Normal clone: watch the specific git files whose changes matter.
+        let head = git_path.join("HEAD");
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+        let index = git_path.join("index");
+        if index.exists() {
+            println!("cargo:rerun-if-changed={}", index.display());
+        }
     } else if git_path.is_file() {
         // Git worktree: .git is a pointer file; watches the worktree's HEAD.
-        println!("cargo:rerun-if-changed={}", git_path.join("HEAD").display());
+        let head = git_path.join("HEAD");
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
     }
 
     let exact_tag = git(&["describe", "--tags", "--exact-match", "HEAD"]);
