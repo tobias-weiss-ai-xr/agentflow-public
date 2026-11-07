@@ -12,8 +12,9 @@ scheduler/status/worktree/dispatch.
 14 rounds of dogfooding (agentflow dispatching tasks that improve agentflow)
 have hardened every feature: each round spec'd the change, wrote tests, ran a
 real campaign against real LLM agents, probed the result against a pre-change
-binary, and documented the outcome. The current state is 167 commits, 340
-tests, 96.83% line coverage, 7 OpenSpec specs (43 requirements, 148 scenarios).
+binary, and documented the outcome. The current state: 466 tests, 95.50% line
+coverage against a 94% raise-only ratchet, and 7 live OpenSpec specs (57
+requirements).
 
 ## 4.2 Strategy principles
 

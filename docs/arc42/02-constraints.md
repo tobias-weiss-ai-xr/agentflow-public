@@ -12,17 +12,17 @@
 | Config | JSON via `serde`; `tasks.json` / `workers.json` / optional `repos.json` schema-compatible with taskfleet's shipped examples |
 | State | JSON files under `state/`, atomic writes (temp + fsync + rename), single writer process, lock file *(ADR-3)* |
 | Receipts | JSON files under `state/receipts/`, one per attempt, atomic write (unique temp filename + fsync + rename) |
-| Test suite | 340 tests (unit + integration + E2E + contract); line-coverage ratchet at 94% (`.coverage-min`, `scripts/coverage-gate.sh`) |
+| Test suite | 466 tests (unit + integration + E2E + contract); line-coverage ratchet at 94% (`.coverage-min`, `scripts/coverage-gate.sh`, measured 95.50%) |
 | Dependencies | `serde`, `serde_json` only — zero runtime deps beyond std |
 
 ## Organizational / Process
 
 | Constraint | Value |
 |-----------|-------|
-| Repo visibility | agentflow = **public** (GitHub, MIT); taskfleet = **private** internal *(ADR-8)* |
+| Repo visibility | The public **agentflow** product repo = MIT open source; internal tooling and campaign configs (incl. the legacy bash runner) stay in **private** repositories *(ADR-8)* |
 | Development workflow | **Spec → Contract → Test pyramid** for every change *(ADR-5)*: OpenSpec spec first, executable contract tests, then unit/integration/E2E pyramid |
 | Documentation | arc42, one file per chapter in `docs/arc42/` *(ADR-7)*, maintained in the same change as the code |
-| Dogfooding | agentflow is used to improve agentflow (14 rounds, 167 commits); every feature is spec'd, tested, and probed before/after against a pre-change binary |
+| Dogfooding | agentflow is used to improve agentflow (14 rounds and counting); every feature is spec'd, tested, and probed before/after against a pre-change binary |
 | No secrets | Public repo must never contain credentials, hosts, or internal campaign configs |
 
 ## Runtime Environment

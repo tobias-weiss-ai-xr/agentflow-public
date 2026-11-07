@@ -24,7 +24,7 @@ semantics (scheduler, gates, worktrees) that agentflow re-implements cleanly.
 | G5 | Scope checking: advisory + enforced — `touch` validation, scope-violation detection, contention avoidance | ✅ shipped |
 | G6 | Observability: status board, per-task logs, cost receipts, `af cost` with waste/recovery ledger | ✅ shipped |
 | G7 | Config compatibility: `tasks.json` / `workers.json` schemas work with existing taskfleet configs | ✅ shipped |
-| G8 | Sound architecture: spec → contract → test pyramid discipline (340 tests, 96.83% line coverage) | ✅ shipped |
+| G8 | Sound architecture: spec → contract → test pyramid discipline (466 tests, line-coverage ratchet at 94%, measured 95.50%) | ✅ shipped |
 | G9 | Multi-repo: one campaign can touch several repositories (`repos.json`, per-task `repo`) | ✅ shipped (ADR-11) |
 | G10 | Measured routing: UCB1 worker selection from receipt history, cost-aware tie-breaks | ✅ shipped (ADR-12) |
 | G11 | Retry memory: failed attempts record their error; retry prompts list earlier failures | ✅ shipped (ADR-13) |
@@ -44,7 +44,7 @@ semantics (scheduler, gates, worktrees) that agentflow re-implements cleanly.
 - **Honest success**: `Merged` is never inferred from an exit code. A dirty worktree is committed before judging; zero commits ahead is a failure; the branch tip is verified in the base.
 - **Work preservation**: a failed attempt's committed work is never destroyed — on ANY failure path (stall, timeout, non-zero exit, scope violation, merge conflict, interrupted) the branch is archived and recoverable.
 - **Cost transparency**: every attempt leaves a receipt (worker, model, wall-clock, tokens, cost); `af cost` reports measured cost, declared-basis estimates, waste by reason, and reclaimed (recovered) work.
-- **Testability**: every module testable in isolation; the whole pipeline runnable against a *fake* agent CLI and a scratch git repo (340 tests, no network in CI).
+- **Testability**: every module testable in isolation; the whole pipeline runnable against a *fake* agent CLI and a scratch git repo (466 tests, no network in CI).
 - **Maintainability**: strict module boundaries, documented via this arc42 documentation; a coverage ratchet (94% floor) prevents silent rot.
 
 ## Stakeholders

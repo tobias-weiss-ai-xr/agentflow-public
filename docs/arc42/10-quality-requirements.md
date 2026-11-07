@@ -9,7 +9,7 @@
 | 1 | **Worktree isolation.** Each attempt runs in its own git worktree + branch; retries are fresh branches; concurrent attempts never see each other's partial state. | `worktree.rs`, `execute.rs`, `run.rs` |
 | 1 | **Atomic persistence.** State files (status, receipts) survive every crash scenario without corruption. Single writer; temp+fsync+rename writes; append-only receipts. | `state.rs` |
 | 2 | **+Directly measurable routing.** UCB1 from receipts; tie-breaks declared cost then duration; trust surfaced in `af cost`. Excludes invented heuristics, proxy conversions, or name-based inference. | `router.rs`, 08.2 |
-| 2 | **Test pyramid.** Unit tests > integration > E2E for every feature. 340 tests, 96.83% line coverage, raise-only ratchet. | CI, `.coverage-min`, `scripts/coverage-gate.sh` |
+| 2 | **Test pyramid.** Unit tests > integration > E2E for every feature. 466 tests, 95.50% line coverage, raise-only ratchet at 94%. | CI, `.coverage-min`, `scripts/coverage-gate.sh` |
 | 2 | **Zero runtime dependencies** beyond std + serde. | `Cargo.toml` |
 | 3 | **Spec contract tests.** Every public module boundary carries executable guarantees (totality, exit codes, error contracts). | contract/ modules in `tests/` |
 | 3 | **+Honest ledger.** `af cost` reports what happened, not what was hoped. Measured cost separate from estimated; interrupted vs failed vs recovered vs merged all distinct. | `run.rs::cost`, `state.rs::Receipt` |
@@ -59,12 +59,12 @@
 
 | Level | Count | Purpose | Example |
 |-------|-------|---------|---------|
-| Unit (crate internals) | 205 | Pure functions; boundaries stubbed | `router::tests`, `scheduler::tests`, `worktree::tests` |
-| Integration (module joining) | 37 | Multiple modules wired; scratch git repos; fake agent | `retry_pacing.rs`, `interrupted.rs`, `receipt_atomic.rs` |
-| Contract (module guarantees) | 30 | Totality, exit codes, error contracts per public module | `contract_worktree.rs`, `contract_scheduler.rs` |
-| E2E (full binary) | 53 | Real `af` binary, scratch repos, behavioral assertions | `cli.rs`, `e2e.rs` |
+| Unit (crate internals — lib + both bins) | 218 | Pure functions; boundaries stubbed | `router::tests`, `scheduler::tests`, `worktree::tests` |
+| Integration (module joining) | 59 | Multiple modules wired; scratch git repos; fake agent | `retry_pacing.rs`, `interrupted.rs`, `receipt_atomic.rs`, `budget.rs` |
+| Contract (module guarantees) | 72 | Totality, exit codes, error contracts per public module | `contract_worktree.rs`, `contract_scheduler.rs` |
+| E2E (full binary) | 113 | Real `af` binary, scratch repos, behavioral assertions | `cli.rs`, `e2e.rs`, `conformance.rs` |
 | Spec traceability | 4 | OpenSpec scenarios ↔ test fixtures | `spec_traceability.rs` |
-| **Total** | **340** | | |
+| **Total** | **466** | | |
 
 Flow-down: unit tests prove each function; integration joins modules;
 contract tests prove the interface; E2E validates the binary; spec
@@ -77,7 +77,7 @@ finite-state scenarios tested by both unit and E2E.
   --show-missing-lines --fail-under-lines $(cat .coverage-min)`
 - Policy: **raise-only**; lowering requires revising the floor in
   `.coverage-min`
-- Current: **96.83% total / 97.42% line** (post round 14)
+- Current: **95.50% line** (measured on the current tree)
 - CI: `cargo llvm-cov` installed via GitHub Actions workflow
 - Note: Spawned stub binaries (`example_agent`) are NOT covered by llvm-cov
   (subprocess, not in-process) — they must remain thin printers

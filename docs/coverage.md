@@ -1,7 +1,7 @@
 # Coverage ratchet
 
 `agentflow` enforces a **line-coverage floor** in CI so coverage can only move
-up. The measured baseline on the current tree is **94.19% of lines**; the floor
+up. The measured baseline on the current tree is **95.50% of lines**; the floor
 is set just below it at **94%** and may only be raised from there.
 
 ## What it enforces
