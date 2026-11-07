@@ -17,6 +17,8 @@ pub mod scheduler;
 pub mod state;
 pub mod subprocess;
 pub mod transcript;
+/// Pure version-composition rules for `af`.
+pub mod version;
 pub mod worktree;
 
 pub use config::{Config, Settings, Task, TaskState, Worker, WorkerDefaults};
