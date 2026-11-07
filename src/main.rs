@@ -266,7 +266,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if argv[0] == "--version" || argv[0] == "-V" {
-        println!("af {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "af {}",
+            option_env!("AF_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let args = match parse(&argv) {
