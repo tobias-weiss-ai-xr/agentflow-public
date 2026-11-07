@@ -35,12 +35,16 @@ fn main() {
     // dirty and rebuilt from scratch on every cargo build/test/clippy.
     //
     // Watching the specific files captures exactly the state that determines
-    // the version: a commit or checkout moves `.git/HEAD` (count + short sha
-    // change) and staging a change touches `.git/index` (dirty flag changes).
-    // Our own (read-only) `git status --porcelain` does not touch those files,
-    // so there is no churn. Accepted minor limitation: a plain edit to a
-    // tracked file touches neither `.git/HEAD` nor `.git/index`, so the
-    // `.dirty` suffix can go stale until the next `git add` or commit.
+    // the version: a commit rewrites `.git/index` (count + short-sha change),
+    // a checkout moves `.git/HEAD`, and staging touches `.git/index` (dirty
+    // flag changes). Our own (read-only) `git status --porcelain` does not
+    // touch those files, so there is no churn. Accepted minor limitations: a
+    // plain edit to a tracked file touches neither `.git/HEAD` nor
+    // `.git/index`, so the `.dirty` suffix can go stale until the next
+    // `git add`; and ref-only operations that touch neither file (e.g.
+    // `git reset --soft`, `git branch -f`, or fetching a new tag onto the
+    // current HEAD) can leave the version stale until the next
+    // commit/checkout/stage.
     let git_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".git");
     if git_path.is_dir() {
         // Normal clone: watch the specific git files whose changes matter.
@@ -53,10 +57,36 @@ fn main() {
             println!("cargo:rerun-if-changed={}", index.display());
         }
     } else if git_path.is_file() {
-        // Git worktree: .git is a pointer file; watches the worktree's HEAD.
-        let head = git_path.join("HEAD");
-        if head.exists() {
-            println!("cargo:rerun-if-changed={}", head.display());
+        // Linked worktree or submodule: `.git` is a file whose content is
+        // `gitdir: <path>\n`, a pointer to the real git dir. Traversing
+        // `<manifest>/.git/HEAD` through that regular file can never exist,
+        // so parse the pointer, resolve it relative to the manifest dir if it
+        // is not absolute, and watch the real HEAD and index files instead.
+        // If parsing fails, emit nothing and let Cargo fall back to its
+        // default whole-package tracking (same as today's behavior).
+        if let Ok(pointer) = std::fs::read_to_string(&git_path) {
+            let gitdir = pointer
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .strip_prefix("gitdir:")
+                .map(str::trim)
+                .map(std::path::Path::new);
+            if let Some(gitdir) = gitdir {
+                let resolved = if gitdir.is_absolute() {
+                    gitdir.to_path_buf()
+                } else {
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(gitdir)
+                };
+                let head = resolved.join("HEAD");
+                if head.exists() {
+                    println!("cargo:rerun-if-changed={}", head.display());
+                }
+                let index = resolved.join("index");
+                if index.exists() {
+                    println!("cargo:rerun-if-changed={}", index.display());
+                }
+            }
         }
     }
 
