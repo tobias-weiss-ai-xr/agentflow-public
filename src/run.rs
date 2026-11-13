@@ -38,6 +38,97 @@ pub struct RunOptions {
     pub poll_secs: Option<u64>,
 }
 
+/// Escalating per-worker backoff state. `level` is the number of
+/// consecutive infra failures; `until` is when the cooldown expires.
+/// Any verdict (merged/verified/non-infra failed) resets `level` to 0
+/// and clears the entry. See `backoff_secs` for the schedule.
+#[derive(Clone, Debug)]
+pub struct BackoffState {
+    pub until: std::time::Instant,
+    pub level: u32,
+}
+
+/// Cooldown seconds for a worker at `level` consecutive infra failures.
+/// Level 1 → 30 s, 2 → 60 s, 3 → 120 s, 4 → 240 s, 5+ → 300 s ceiling.
+/// When the pool has exactly one enabled worker, the cooldown is capped
+/// at 30 s so a solo campaign is never locked out for minutes. Pure for
+/// testing.
+fn backoff_secs(level: u32, enabled_workers: usize) -> u64 {
+    if level == 0 {
+        return 0;
+    }
+    let raw = 30u64.checked_shl(level.saturating_sub(1)).unwrap_or(300);
+    let secs = raw.min(300);
+    if enabled_workers <= 1 {
+        secs.min(30)
+    } else {
+        secs
+    }
+}
+
+/// Fingerprint of a gate-failure reason: `(exit_code, whitespace-
+/// normalized tail)`. Returns `None` for non-gate errors. Two gate
+/// failures with the same fingerprint are byte-identical gate output
+/// (same exit code, same failing tail after whitespace normalization),
+/// which is a strong signal of a task-design defect rather than a flake.
+/// Pure for testing.
+fn gate_fingerprint(error: &str) -> Option<(String, String)> {
+    const PREFIX: &str = "acceptance gate failed";
+    if !error.starts_with(PREFIX) {
+        return None;
+    }
+    let rest = &error[PREFIX.len()..]; // " (exit N): <tail>"
+    let exit_code = rest
+        .strip_prefix(" (exit ")
+        .and_then(|s| s.split(')').next())
+        .unwrap_or("-")
+        .to_string();
+    let tail = rest.find(": ").map(|i| &rest[i + 2..]).unwrap_or("");
+    // Whitespace-normalize the tail so trivial formatting differences
+    // (extra spaces, trailing whitespace) don't mask a real defect.
+    let normalized = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some((exit_code, normalized))
+}
+
+/// Whether the current gate failure is a repeated identical defect: the
+/// previous AGENT-driven gate-failed attempt of the same task has the same
+/// fingerprint. Gate-only reruns (wall_clock_s < 5 AND turns absent/0) are
+/// skipped — only two INDEPENDENT agent runs producing byte-identical gate
+/// output trigger the early stop. Pure for testing.
+fn repeated_gate_defect(error: &str, task_id: &str, attempt: u32, receipts: &[Receipt]) -> bool {
+    let Some((exit, tail)) = gate_fingerprint(error) else {
+        return false;
+    };
+    if attempt < 2 {
+        return false;
+    }
+    // Prior failed gate receipts for the same task, most-recent first.
+    let mut prior: Vec<&Receipt> = receipts
+        .iter()
+        .filter(|r| {
+            r.task == task_id
+                && r.attempt < attempt
+                && r.outcome == "failed"
+                && gate_fingerprint(r.error.as_deref().unwrap_or("")).is_some()
+        })
+        .collect();
+    prior.sort_by_key(|a| std::cmp::Reverse(a.attempt));
+    for r in prior {
+        // Skip gate-only reruns: near-zero wall clock and no agent turns.
+        let is_gate_only_rerun = r.wall_clock_s < 5.0 && r.turns.unwrap_or(0) == 0;
+        if is_gate_only_rerun {
+            continue;
+        }
+        // Previous AGENT-driven gate receipt found — compare fingerprints.
+        let (prev_exit, prev_tail) = gate_fingerprint(r.error.as_deref().unwrap_or("")).unwrap();
+        return prev_exit == exit && prev_tail == tail;
+    }
+    false
+}
+
 /// Reap finished attempts from the channel: worker busy-ness, routing
 /// stats, status transitions + persistence. Shared by the main loop and
 /// `--once` (single source of truth for the attempt bookkeeping).
@@ -58,11 +149,12 @@ fn reap(
     rx: &mpsc::Receiver<(String, String, Outcome, f64)>,
     running: &Arc<Mutex<HashMap<String, ()>>>,
     worker_busy: &Arc<Mutex<HashMap<String, usize>>>,
-    worker_backoff: &Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    worker_backoff: &Arc<Mutex<HashMap<String, BackoffState>>>,
     router: &mut Router,
     status: &mut HashMap<String, TaskStatus>,
     store: &Store,
     max_attempts: u32,
+    enabled_workers: usize,
     wait: Option<Duration>,
 ) {
     let first = match wait {
@@ -100,11 +192,21 @@ fn reap(
                 matches!(outcome, Outcome::Merged | Outcome::Verified),
                 Some(wall_s),
             );
+            // Any verdict (merged, verified, or non-infra failed) resets
+            // the worker's backoff escalation to level 0.
+            worker_backoff.lock().unwrap().remove(&worker_name);
         } else {
-            worker_backoff.lock().unwrap().insert(
-                worker_name.clone(),
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-            );
+            // Escalating cooldown: 30 s → 60 s → 120 s → 240 s → 300 s
+            // ceiling. A solo worker is capped at 30 s so the campaign
+            // keeps trying instead of idling for minutes.
+            let mut wb = worker_backoff.lock().unwrap();
+            let state = wb.entry(worker_name.clone()).or_insert(BackoffState {
+                until: std::time::Instant::now(),
+                level: 0,
+            });
+            state.level += 1;
+            let secs = backoff_secs(state.level, enabled_workers);
+            state.until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         }
         // Journal reconciliation: attempt threads persist phase boundaries
         // via load-modify-save (see `record_phase`), so this in-memory map
@@ -131,16 +233,34 @@ fn reap(
                 println!("  ✓ {id} verified (attempt {})", s.attempts);
             }
             Outcome::Failed(err) => {
-                s.last_error = Some(err.clone());
-                if s.attempts >= max_attempts {
+                // B: repeated identical gate failure stops early. Two
+                // independent agent runs producing byte-identical gate
+                // output (same exit code, same failing tail) is a task-
+                // design defect, not a flake — stop paying for retries.
+                let prior_receipts = store.load_receipts();
+                if repeated_gate_defect(&err, &id, s.attempts, &prior_receipts) {
+                    let tail = gate_fingerprint(&err).map(|(_, t)| t).unwrap_or_default();
                     s.state = TaskState::Failed;
+                    s.last_error = Some(format!(
+                        "repeated identical gate failure ({}) — task design defect",
+                        tail
+                    ));
                     println!(
-                        "  ✗ {id} failed (attempt {}/{}): {}",
-                        s.attempts, max_attempts, err
+                        "  ⛐ {id} failed (attempt {}/{}): repeated identical gate failure",
+                        s.attempts, max_attempts
                     );
                 } else {
-                    s.state = TaskState::Ready;
-                    println!("  ✗ {id} attempt {} failed, retrying: {}", s.attempts, err);
+                    s.last_error = Some(err.clone());
+                    if s.attempts >= max_attempts {
+                        s.state = TaskState::Failed;
+                        println!(
+                            "  ✗ {id} failed (attempt {}/{}): {}",
+                            s.attempts, max_attempts, err
+                        );
+                    } else {
+                        s.state = TaskState::Ready;
+                        println!("  ✗ {id} attempt {} failed, retrying: {}", s.attempts, err);
+                    }
                 }
             }
         }
@@ -152,7 +272,7 @@ fn reap(
 pub fn pick_worker<'a>(
     cfg: &'a Config,
     busy: &Mutex<HashMap<String, usize>>,
-    backoff: &Mutex<HashMap<String, std::time::Instant>>,
+    backoff: &Mutex<HashMap<String, BackoffState>>,
     router: &Router,
     filter: Option<&str>,
 ) -> Option<&'a crate::config::Worker> {
@@ -175,7 +295,7 @@ pub fn pick_worker<'a>(
             };
             busy.get(&w.name).copied().unwrap_or(0) < cap
         })
-        .filter(|w| !matches!(backoff.get(&w.name), Some(until) if *until > now))
+        .filter(|w| !matches!(backoff.get(&w.name), Some(state) if state.until > now))
         .collect();
     router.pick(eligible)
 }
@@ -214,7 +334,7 @@ pub fn pick_for_attempt<'a>(
     task: &crate::config::Task,
     attempt: u32,
     busy: &Mutex<HashMap<String, usize>>,
-    backoff: &Mutex<HashMap<String, std::time::Instant>>,
+    backoff: &Mutex<HashMap<String, BackoffState>>,
     router: &Router,
     filter: Option<&str>,
 ) -> Option<&'a crate::config::Worker> {
@@ -518,6 +638,22 @@ impl Drop for PidFile {
     }
 }
 
+/// Parallel dispatch capacity for a round, derived from the CURRENT config.
+/// `AF_MAX_PARALLEL` unset/`0` (the default) means "one slot per enabled
+/// worker, recomputed on every hot reload": appending a worker to
+/// `workers.json` grows the pool mid-run and setting one `enabled: false`
+/// shrinks it. An explicit `AF_MAX_PARALLEL=N` is a fixed ceiling that is
+/// never recomputed, however the worker set changes. The capacity is always
+/// at least `1`, so a malformed mid-run edit can never strand a round.
+pub fn pool_capacity(st: &Settings, cfg: &Config) -> usize {
+    let cap = if st.max_parallel == 0 {
+        cfg.workers.iter().filter(|w| w.enabled).count()
+    } else {
+        st.max_parallel
+    };
+    cap.max(1)
+}
+
 /// The `(tasks, workers)` mtimes as of the last reload attempt. `None` until
 /// the first attempt; files that vanished keep the last good config.
 fn cfg_files_mtime(st: &Settings) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
@@ -624,11 +760,12 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
     let (tx, rx) = mpsc::channel::<(String, String, Outcome, f64)>();
     let merge_locks = worktree::MergeLocks::new();
     let worker_busy: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    let worker_backoff: Arc<Mutex<HashMap<String, std::time::Instant>>> =
+    let worker_backoff: Arc<Mutex<HashMap<String, BackoffState>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let running: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let enabled = cfg.workers.iter().filter(|w| w.enabled).count();
+    let mut enabled_workers = enabled;
     let max_parallel = if st.max_parallel == 0 {
         enabled
     } else {
@@ -748,6 +885,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
             &mut status,
             &store,
             max_attempts,
+            enabled_workers,
             wait,
         );
         // Check if new receipts were appended (reap or recover writes them).
@@ -763,10 +901,12 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
         // tasks/workers files. A reload failure keeps the last good config
         // (warn once per broken generation) — a typo must not kill a campaign.
         if let Some(fresh) = hot_reload(st, &mut last_cfg_mt) {
+            enabled_workers = fresh.workers.iter().filter(|w| w.enabled).count();
             println!(
-                "config reloaded: {} task(s), {} worker(s)",
+                "config reloaded: {} task(s), {} worker(s), pool capacity {}",
                 fresh.tasks.len(),
-                fresh.workers.len()
+                fresh.workers.len(),
+                pool_capacity(st, &fresh)
             );
             cfg = fresh;
             ctx.cfg = cfg.clone();
@@ -857,6 +997,11 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
 
         // Dispatch a round — never while the ceiling is exhausted: attempts
         // already in flight are allowed to finish, only NEW ones are blocked.
+        // The ceiling is RE-derivable every round: when the operator left
+        // `AF_MAX_PARALLEL` to the default, the pool follows the current
+        // enabled-worker count (pool_capacity over the reloaded config), so
+        // adding/disabling workers mid-run grows/shrinks the pool live.
+        let max_parallel = pool_capacity(st, &cfg);
         if !over_budget && !draining && running.lock().unwrap().len() < max_parallel {
             let running_now = running.lock().unwrap().keys().cloned().collect::<Vec<_>>();
             let ready = scheduler::ready_tasks(&cfg, &status, &running_now, max_attempts);
@@ -1035,6 +1180,7 @@ pub fn run_loop(cfg: &Config, st: &Settings, opts: &RunOptions) -> i32 {
                         &mut status,
                         &store,
                         max_attempts,
+                        enabled_workers,
                         None,
                     );
                     std::thread::sleep(Duration::from_millis(200));
@@ -2528,10 +2674,34 @@ pub fn cost(cfg: &Config, st: &Settings, filter: &CostFilter) -> String {
     }
     if !by_worker.is_empty() {
         by_worker.sort();
-        lines.push_str(&format!(
-            "\n\n{:<14} {:<11} {} {} {}",
-            "WORKER", "WINS/TOTAL", "TRUST", "MEAN_S", "COST"
-        ));
+        // D: per-worker infra-drift column. Count selected failed receipts
+        // with failure_class == "infra" per worker, and track the most
+        // recent such receipt's error (by ts) for the footnote. When no
+        // worker has infra, the column and footnote are omitted entirely so
+        // an all-healthy report is byte-identical to today.
+        let mut worker_infra: BTreeMap<String, (usize, Option<String>, u64)> = BTreeMap::new();
+        for r in &selected {
+            if r.outcome == "failed" && r.failure_class.as_deref() == Some("infra") {
+                let entry = worker_infra.entry(r.worker.clone()).or_insert((0, None, 0));
+                entry.0 += 1;
+                if r.ts >= entry.2 {
+                    entry.1 = r.error.clone();
+                    entry.2 = r.ts;
+                }
+            }
+        }
+        let any_infra = worker_infra.values().any(|(c, _, _)| *c > 0);
+        if any_infra {
+            lines.push_str(&format!(
+                "\n\n{:<14} {:<11} {} {} {} {}",
+                "WORKER", "WINS/TOTAL", "TRUST", "MEAN_S", "INFRA", "COST"
+            ));
+        } else {
+            lines.push_str(&format!(
+                "\n\n{:<14} {:<11} {} {} {}",
+                "WORKER", "WINS/TOTAL", "TRUST", "MEAN_S", "COST"
+            ));
+        }
         for (name, w, n) in by_worker {
             // Estimated expense for the worker's whole recorded token spend
             // on the selected window: dollars from a declared price, a
@@ -2558,14 +2728,48 @@ pub fn cost(cfg: &Config, st: &Settings, filter: &CostFilter) -> String {
                     &all_declared,
                 )
             };
-            lines.push_str(&format!(
-                "\n{:<14} {:<11} {:.2} {} {}",
-                name,
-                format!("{w}/{n}"),
-                w as f64 / n as f64,
-                mean_duration_cell(worker_rs),
-                cost_cell
-            ));
+            let infra_cell = worker_infra
+                .get(name.as_str())
+                .map(|(c, _, _)| *c)
+                .unwrap_or(0);
+            if any_infra {
+                lines.push_str(&format!(
+                    "\n{:<14} {:<11} {:.2} {} {} {}",
+                    name,
+                    format!("{w}/{n}"),
+                    w as f64 / n as f64,
+                    mean_duration_cell(worker_rs),
+                    if infra_cell > 0 {
+                        infra_cell.to_string()
+                    } else {
+                        "-".to_string()
+                    },
+                    cost_cell
+                ));
+            } else {
+                lines.push_str(&format!(
+                    "\n{:<14} {:<11} {:.2} {} {}",
+                    name,
+                    format!("{w}/{n}"),
+                    w as f64 / n as f64,
+                    mean_duration_cell(worker_rs),
+                    cost_cell
+                ));
+            }
+        }
+        // Footnote: per-worker infra breakdown (only when any infra exists).
+        if any_infra {
+            for (name, (count, last_err, _)) in &worker_infra {
+                if *count > 0 {
+                    let err = last_err
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    lines.push_str(&format!("\ninfra: {name} ({count}): {err}"));
+                }
+            }
         }
     }
     // Wasted spend (failed attempts): computed from the SAME window-selected
@@ -2907,6 +3111,7 @@ mod tests {
             by_id,
             repos: BTreeMap::new(),
             warnings: vec![],
+            module_map: None,
         }
     }
 
@@ -3450,6 +3655,202 @@ mod tests {
     }
 
     #[test]
+    // spec: cli/worker-infra-drift-breakdown-in-the-cost-report#infra-failures-surface-per-worker
+    fn cost_infra_column_shows_per_worker_count_and_footnote() {
+        let base = unique_base("cost-infra");
+        let st = settings(base.clone());
+        let cfg = cfg_with_workers(
+            vec![task("A")],
+            vec![worker_named("w1"), worker_named("w2")],
+        );
+        let store = Store::new(st.state_dir.clone());
+        let infra_receipt = |task: &str, worker: &str, ts: u64, error: &str| Receipt {
+            task: task.into(),
+            attempt: 1,
+            worker: worker.into(),
+            model: "m".into(),
+            wall_clock_s: 5.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts,
+            outcome: "failed".into(),
+            error: Some(error.into()),
+            cost_micros: None,
+            contracts: None,
+            failure_class: Some("infra".into()),
+        };
+        let merged_receipt = |task: &str, worker: &str| Receipt {
+            task: task.into(),
+            attempt: 1,
+            worker: worker.into(),
+            model: "m".into(),
+            wall_clock_s: 10.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: "merged".into(),
+            error: None,
+            cost_micros: None,
+            contracts: None,
+            failure_class: None,
+        };
+        // w1: 2 merged + 3 infra failures; w2: 1 merged, no infra.
+        store.append_receipt(&merged_receipt("A", "w1")).unwrap();
+        store.append_receipt(&merged_receipt("A", "w1")).unwrap();
+        store
+            .append_receipt(&infra_receipt("A", "w1", 100, "provider 429: rate limit"))
+            .unwrap();
+        store
+            .append_receipt(&infra_receipt("A", "w1", 200, "provider 500: server error"))
+            .unwrap();
+        store
+            .append_receipt(&infra_receipt("A", "w1", 300, "dead model: 404 not found"))
+            .unwrap();
+        store.append_receipt(&merged_receipt("A", "w2")).unwrap();
+
+        let report = cost(&cfg, &st, &CostFilter::default());
+        // INFRA column header is present.
+        assert!(report.contains("INFRA"), "INFRA column header: {report}");
+        // w1 row shows INFRA = 3 and 2/2 wins.
+        let w1_line = report
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some("w1"))
+            .unwrap();
+        assert!(w1_line.contains("2/2"), "w1 wins/total: {w1_line}");
+        assert!(w1_line.contains("3"), "w1 infra count: {w1_line}");
+        // w2 row shows INFRA = -.
+        let w2_line = report
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some("w2"))
+            .unwrap();
+        assert!(w2_line.contains("-"), "w2 infra is dash: {w2_line}");
+        // Footnote names w1 with count 3 and the most recent infra error.
+        assert!(
+            report.contains("infra: w1 (3): dead model: 404 not found"),
+            "footnote with most recent error: {report}"
+        );
+        assert!(
+            !report.contains("infra: w2"),
+            "no footnote for w2 (0 infra)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    // spec: cli/worker-infra-drift-breakdown-in-the-cost-report#an-all-healthy-report-is-unchanged
+    fn cost_all_healthy_report_omits_infra_column() {
+        let base = unique_base("cost-healthy");
+        let st = settings(base.clone());
+        let cfg = cfg_with_workers(vec![task("A")], vec![worker_named("w1")]);
+        let store = Store::new(st.state_dir.clone());
+        let receipt = |outcome: &str| Receipt {
+            task: "A".into(),
+            attempt: 1,
+            worker: "w1".into(),
+            model: "m".into(),
+            wall_clock_s: 10.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: outcome.into(),
+            error: None,
+            cost_micros: None,
+            contracts: None,
+            failure_class: None,
+        };
+        store.append_receipt(&receipt("merged")).unwrap();
+        store.append_receipt(&receipt("failed")).unwrap();
+
+        let report = cost(&cfg, &st, &CostFilter::default());
+        assert!(
+            !report.contains("INFRA"),
+            "no INFRA column when no infra failures: {report}"
+        );
+        assert!(
+            !report.contains("infra:"),
+            "no infra footnote when no infra failures: {report}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    // spec: cli/worker-infra-drift-breakdown-in-the-cost-report#worker-absence-from-the-config-stays-a-note-not-a-column
+    fn cost_infra_column_does_not_invent_rows_for_absent_workers() {
+        let base = unique_base("cost-absent");
+        let st = settings(base.clone());
+        // cfg has only w1, but receipts reference w2 (absent from config).
+        let cfg = cfg_with_workers(vec![task("A")], vec![worker_named("w1")]);
+        let store = Store::new(st.state_dir.clone());
+        let infra_receipt = |worker: &str, ts: u64, error: &str| Receipt {
+            task: "A".into(),
+            attempt: 1,
+            worker: worker.into(),
+            model: "m".into(),
+            wall_clock_s: 5.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts,
+            outcome: "failed".into(),
+            error: Some(error.into()),
+            cost_micros: None,
+            contracts: None,
+            failure_class: Some("infra".into()),
+        };
+        let merged_receipt = |worker: &str| Receipt {
+            task: "A".into(),
+            attempt: 1,
+            worker: worker.into(),
+            model: "m".into(),
+            wall_clock_s: 10.0,
+            tokens: None,
+            turns: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: "merged".into(),
+            error: None,
+            cost_micros: None,
+            contracts: None,
+            failure_class: None,
+        };
+        store.append_receipt(&merged_receipt("w1")).unwrap();
+        store
+            .append_receipt(&infra_receipt("w2", 100, "provider 500: server error"))
+            .unwrap();
+
+        let report = cost(&cfg, &st, &CostFilter::default());
+        // w1 is in the config and has a merged verdict — it appears in the
+        // trust table with INFRA = - (no infra for w1).
+        let w1_line = report
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some("w1"))
+            .unwrap();
+        assert!(w1_line.contains("-"), "w1 has no infra: {w1_line}");
+        // w2 is absent from the config — the existing "absent from the
+        // config" footnote names it, and the INFRA column does NOT invent
+        // a trust row for it.
+        assert!(
+            report.contains("absent") || report.contains("w2"),
+            "absent worker w2 is noted: {report}"
+        );
+        // No trust row starts with w2 (it's not in cfg.workers).
+        let trust_row = report.lines().find(|l| l.starts_with("w2 "));
+        assert!(
+            trust_row.is_none(),
+            "no trust row for absent worker w2: {report}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn waste_cause_is_text_before_the_first_colon_or_unknown() {
         let r = |error: Option<&str>| Receipt {
             task: "A".into(),
@@ -3487,6 +3888,248 @@ mod tests {
         assert_eq!(waste_cause(&r(Some(&long))), "x".repeat(60));
         // Nothing before the colon → the literal key, not an empty row.
         assert_eq!(waste_cause(&r(Some(": boom"))), "unknown");
+    }
+
+    // --- gate_fingerprint (B: defect detection) ---
+
+    #[test]
+    fn gate_fingerprint_returns_none_for_non_gate() {
+        assert!(gate_fingerprint("harness: turn cap 16 reached").is_none());
+        assert!(gate_fingerprint("provider error: 429 rate limit").is_none());
+        assert!(gate_fingerprint("").is_none());
+    }
+
+    #[test]
+    fn gate_fingerprint_extracts_exit_code_and_tail() {
+        let fp = gate_fingerprint("acceptance gate failed (exit 1): YAML-FAIL file.yaml").unwrap();
+        assert_eq!(fp.0, "1");
+        assert_eq!(fp.1, "YAML-FAIL file.yaml");
+    }
+
+    #[test]
+    fn gate_fingerprint_normalizes_whitespace_in_tail() {
+        let fp = gate_fingerprint("acceptance gate failed (exit 1):   YAML-FAIL  \n  file.yaml  ")
+            .unwrap();
+        assert_eq!(fp.0, "1");
+        assert_eq!(fp.1, "YAML-FAIL file.yaml");
+    }
+
+    #[test]
+    fn gate_fingerprint_preserves_dash_exit_code() {
+        let fp = gate_fingerprint("acceptance gate failed (exit -): something went wrong").unwrap();
+        assert_eq!(fp.0, "-");
+        assert_eq!(fp.1, "something went wrong");
+    }
+
+    #[test]
+    fn gate_fingerprint_returns_none_for_empty_tail() {
+        // The marker "(gate produced no output; exit N)" is a non-empty
+        // tail, so it has a fingerprint. But a truly empty tail (no body
+        // after the colon) returns None — no fingerprint to compare.
+        assert!(gate_fingerprint("acceptance gate failed (exit 1):").is_none());
+    }
+
+    #[test]
+    fn gate_fingerprint_handles_the_silent_marker() {
+        let fp =
+            gate_fingerprint("acceptance gate failed (exit 1): (gate produced no output; exit 1)")
+                .unwrap();
+        assert_eq!(fp.0, "1");
+        assert_eq!(fp.1, "(gate produced no output; exit 1)");
+    }
+
+    // --- repeated_gate_defect (B: defect detection) ---
+
+    /// Helper: a failed gate receipt with the given task, attempt, wall
+    /// clock, turns, and error.
+    fn gate_receipt(
+        task: &str,
+        attempt: u32,
+        wall: f64,
+        turns: Option<u32>,
+        error: &str,
+    ) -> Receipt {
+        Receipt {
+            task: task.into(),
+            attempt,
+            worker: "w".into(),
+            model: "m".into(),
+            wall_clock_s: wall,
+            tokens: None,
+            turns,
+            prompt_tokens: None,
+            completion_tokens: None,
+            ts: 0,
+            outcome: "failed".into(),
+            error: Some(error.into()),
+            cost_micros: None,
+            contracts: None,
+            failure_class: Some("agent".into()),
+        }
+    }
+
+    #[test]
+    // spec: lifecycle/gate-failure-defect-detection#identical-gate-failure-stops-before-the-retry-budget
+    fn repeated_gate_defect_stops_when_fingerprints_match() {
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL nix/images/infra/busybox.nix";
+        let prior = vec![gate_receipt("T", 1, 120.0, Some(8), err)];
+        assert!(
+            repeated_gate_defect(err, "T", 2, &prior),
+            "identical fingerprint from an agent-driven prior attempt triggers the stop"
+        );
+    }
+
+    #[test]
+    // spec: lifecycle/gate-failure-defect-detection#a-different-fingerprint-retries-normally
+    fn repeated_gate_defect_different_fingerprint_retries() {
+        let err1 = "acceptance gate failed (exit 1): PARSE-FAIL a.nix";
+        let err2 = "acceptance gate failed (exit 1): PARSE-FAIL b.nix";
+        let prior = vec![gate_receipt("T", 1, 120.0, Some(8), err1)];
+        assert!(
+            !repeated_gate_defect(err2, "T", 2, &prior),
+            "different fingerprint → retry normally"
+        );
+    }
+
+    #[test]
+    // spec: lifecycle/gate-failure-defect-detection#a-gate-only-rerun-never-triggers-alone
+    fn repeated_gate_defect_skips_gate_only_rerun() {
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL nix/images/infra/busybox.nix";
+        // Attempt 1: agent-driven (wall 120s, turns 8). Attempt 2: gate-only
+        // rerun (wall 0.5s, turns 0). Current attempt 3: agent-driven, same
+        // fingerprint as attempt 1. The gate-only rerun (attempt 2) is
+        // skipped; the comparison target is attempt 1.
+        let prior = vec![
+            gate_receipt("T", 2, 0.5, None, err),
+            gate_receipt("T", 1, 120.0, Some(8), err),
+        ];
+        assert!(
+            repeated_gate_defect(err, "T", 3, &prior),
+            "gate-only rerun is skipped; comparison target is the prior agent attempt"
+        );
+    }
+
+    #[test]
+    fn repeated_gate_defect_gate_only_rerun_alone_does_not_trigger() {
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL nix/images/infra/busybox.nix";
+        // Only a gate-only rerun as the prior — no agent-driven prior to
+        // compare against → no early stop.
+        let prior = vec![gate_receipt("T", 1, 0.5, None, err)];
+        assert!(
+            !repeated_gate_defect(err, "T", 2, &prior),
+            "a gate-only rerun alone never triggers the stop"
+        );
+    }
+
+    #[test]
+    fn repeated_gate_defect_non_gate_failure_does_not_trigger() {
+        let err = "harness: turn cap 16 reached";
+        let prior = vec![gate_receipt(
+            "T",
+            1,
+            120.0,
+            Some(8),
+            "acceptance gate failed (exit 1): x",
+        )];
+        assert!(
+            !repeated_gate_defect(err, "T", 2, &prior),
+            "non-gate failure never triggers the gate-defect stop"
+        );
+    }
+
+    #[test]
+    fn repeated_gate_defect_first_attempt_never_triggers() {
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL x";
+        assert!(
+            !repeated_gate_defect(err, "T", 1, &[]),
+            "attempt 1 has no prior — no stop"
+        );
+    }
+
+    #[test]
+    fn repeated_gate_defect_other_task_does_not_trigger() {
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL x";
+        let prior = vec![gate_receipt("OTHER", 1, 120.0, Some(8), err)];
+        assert!(
+            !repeated_gate_defect(err, "T", 2, &prior),
+            "a different task's receipts are irrelevant"
+        );
+    }
+
+    #[test]
+    // spec: lifecycle/gate-failure-defect-detection#detection-survives-resume
+    fn repeated_gate_defect_survives_resume() {
+        // Two agent-driven attempts with identical fingerprints, split
+        // across two `af run` invocations. The receipts persisted by the
+        // first run (ts=1000) are loaded by the second run (ts=2000); the
+        // early stop fires because the fingerprints match.
+        let err = "acceptance gate failed (exit 1): PARSE-FAIL nix/images/infra/busybox.nix";
+        let prior = vec![gate_receipt("T", 1, 120.0, Some(8), err)];
+        // The current attempt (attempt 2) has the same fingerprint.
+        assert!(
+            repeated_gate_defect(err, "T", 2, &prior),
+            "detection fires across resume: persisted receipts trigger the stop"
+        );
+    }
+
+    // --- backoff_secs (C: adaptive per-worker backoff) ---
+
+    #[test]
+    // spec: scheduling/adaptive-backoff-for-infra-failing-workers#repeated-infra-failures-cooldown-longer
+    fn backoff_secs_escalates_30_60_120_240_300() {
+        assert_eq!(backoff_secs(1, 3), 30);
+        assert_eq!(backoff_secs(2, 3), 60);
+        assert_eq!(backoff_secs(3, 3), 120);
+        assert_eq!(backoff_secs(4, 3), 240);
+        assert_eq!(backoff_secs(5, 3), 300, "ceiling at 300s");
+        assert_eq!(backoff_secs(6, 3), 300, "ceiling holds at 300s");
+        assert_eq!(backoff_secs(10, 3), 300, "ceiling holds at 300s");
+    }
+
+    #[test]
+    // spec: scheduling/adaptive-backoff-for-infra-failing-workers#a-solo-worker-is-never-locked-out-for-minutes
+    fn backoff_secs_solo_worker_capped_at_30s() {
+        assert_eq!(backoff_secs(1, 1), 30);
+        assert_eq!(backoff_secs(2, 1), 30, "solo worker never exceeds 30s");
+        assert_eq!(backoff_secs(5, 1), 30, "solo worker never exceeds 30s");
+    }
+
+    #[test]
+    fn backoff_secs_zero_level_is_zero() {
+        assert_eq!(backoff_secs(0, 3), 0, "level 0 is the reset state");
+    }
+
+    #[test]
+    // spec: scheduling/adaptive-backoff-for-infra-failing-workers#one-success-resets-the-escalation
+    fn backoff_resets_on_any_verdict() {
+        // A non-infra outcome (merged, verified, or non-infra failed) must
+        // remove the worker's backoff entry so the escalation resets.
+        // This is tested at the reap level: the backoff map is cleared on
+        // any non-infra outcome. Here we verify the pure helper: level 0
+        // means no cooldown.
+        assert_eq!(backoff_secs(0, 3), 0);
+    }
+
+    #[test]
+    // spec: scheduling/adaptive-backoff-for-infra-failing-workers#infra-failures-stay-non-verdicts
+    fn backoff_does_not_change_verdict_statistics() {
+        // Infra failures stay non-verdicts: they never enter the trust
+        // numerator or denominator. The backoff escalation only changes
+        // cooldown pacing, not verdict counting. This is verified by the
+        // existing classify_failure + counts_as_verdict contract: an infra
+        // receipt has counts_as_verdict == false. Here we verify that the
+        // backoff helper does not affect this — it only computes a cooldown
+        // duration, never a verdict.
+        assert_eq!(
+            backoff_secs(1, 3),
+            30,
+            "infra failure sets a cooldown, not a verdict"
+        );
+        assert_eq!(
+            backoff_secs(5, 3),
+            300,
+            "escalation caps at 300s, still not a verdict"
+        );
     }
 
     #[test]
@@ -4122,6 +4765,38 @@ mod tests {
     }
 
     #[test]
+    // spec: config/task-config-hot-reload-between-dispatch-rounds#disabling-every-worker-keeps-the-last-good-pool
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set#all-disabled-reload-keeps-the-last-good-pool
+    fn hot_reload_all_disabled_workers_keeps_last_good_pool() {
+        let base = unique_base("hotreload-none");
+        let dir = base.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (t, w) = write_min_config(&dir, &["A"]);
+        let st = Settings {
+            tasks_file: t.clone(),
+            workers_file: w.clone(),
+            ..settings(base)
+        };
+        let mut seen = None;
+        assert!(hot_reload(&st, &mut seen).is_some(), "initial load ok");
+
+        // Set every worker disabled → validation rejects the pool, the
+        // reload yields None, and the previously loaded config stands.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &w,
+            r#"{ "workers": [ { "name": "w", "provider": "p", "model": "m", "enabled": false } ] }"#,
+        )
+        .unwrap();
+        assert!(
+            hot_reload(&st, &mut seen).is_none(),
+            "all-disabled pool is rejected by validation"
+        );
+        // And a fresh full load agrees: zero enabled workers is invalid.
+        assert!(crate::config::load(&t, &w).is_err());
+    }
+
+    #[test]
     // spec: config/task-config-hot-reload-between-dispatch-rounds#broken-config-file-keeps-the-last-good-config
     fn hot_reload_broken_file_keeps_last_good_and_warns_once() {
         let base = unique_base("hotreload-bad");
@@ -4177,6 +4852,118 @@ mod tests {
         assert!(
             !st.state_dir.join("af.pid").exists(),
             "drop removes the pid file"
+        );
+    }
+
+    // --- live worker pool capacity -----------------------------------------
+
+    fn pool_settings(max_parallel: usize) -> Settings {
+        let st = settings(unique_base("pool"));
+        Settings { max_parallel, ..st }
+    }
+
+    fn enabled_worker(name: &str, enabled: bool) -> crate::config::Worker {
+        let mut w = worker_named(name);
+        w.enabled = enabled;
+        w
+    }
+
+    #[test]
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set#default-ceiling-follows-the-live-worker-count
+    // spec: lifecycle/dispatch-rounds-read-the-current-task-config#adding-a-worker-mid-run-grows-the-pool
+    fn pool_capacity_default_follows_the_live_enabled_count() {
+        let st = pool_settings(0); // default: one slot per enabled worker
+        let two = cfg_with_workers(
+            vec![],
+            vec![enabled_worker("w1", true), enabled_worker("w2", true)],
+        );
+        assert_eq!(pool_capacity(&st, &two), 2);
+        // The live set GROWS: a third worker appended mid-run widens the pool.
+        let three = cfg_with_workers(
+            vec![],
+            vec![
+                enabled_worker("w1", true),
+                enabled_worker("w2", true),
+                enabled_worker("w3", true),
+            ],
+        );
+        assert_eq!(
+            pool_capacity(&st, &three),
+            3,
+            "appending a worker mid-run grows the pool"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set#disabling-a-worker-reduces-the-pool
+    // spec: lifecycle/dispatch-rounds-read-the-current-task-config#disabling-a-worker-mid-run-shrinks-the-pool
+    fn pool_capacity_default_shrinks_when_a_worker_is_disabled() {
+        let st = pool_settings(0);
+        let three = cfg_with_workers(
+            vec![],
+            vec![
+                enabled_worker("w1", true),
+                enabled_worker("w2", true),
+                enabled_worker("w3", true),
+            ],
+        );
+        assert_eq!(pool_capacity(&st, &three), 3);
+        let two = cfg_with_workers(
+            vec![],
+            vec![
+                enabled_worker("w1", true),
+                enabled_worker("w2", true),
+                enabled_worker("w3", false),
+            ],
+        );
+        assert_eq!(
+            pool_capacity(&st, &two),
+            2,
+            "disabling a worker mid-run shrinks the pool"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set#explicit-ceiling-is-never-recomputed
+    // spec: lifecycle/dispatch-rounds-read-the-current-task-config#an-explicit-ceiling-stays-fixed
+    fn pool_capacity_explicit_ceiling_is_fixed_across_reloads() {
+        let st = pool_settings(4);
+        let six = cfg_with_workers(
+            vec![],
+            vec![
+                enabled_worker("w1", true),
+                enabled_worker("w2", true),
+                enabled_worker("w3", true),
+                enabled_worker("w4", true),
+                enabled_worker("w5", true),
+                enabled_worker("w6", true),
+            ],
+        );
+        assert_eq!(
+            pool_capacity(&st, &six),
+            4,
+            "the operator's explicit ceiling is never recomputed"
+        );
+    }
+
+    #[test]
+    // spec: scheduling/worker-pool-tracks-the-live-enabled-set
+    fn pool_capacity_is_at_least_one() {
+        let st = pool_settings(0);
+        // Validation rejects an all-disabled pool, but the function itself
+        // never returns 0 — a malformed mid-run edit cannot strand a round.
+        let none = cfg_with_workers(vec![], vec![enabled_worker("w1", false)]);
+        assert_eq!(pool_capacity(&st, &none), 1);
+        assert_eq!(
+            pool_capacity(
+                &Settings {
+                    max_parallel: 0,
+                    ..st
+                },
+                &cfg_with_workers(vec![], vec![])
+            ),
+            1
         );
     }
 

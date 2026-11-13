@@ -35,7 +35,7 @@ THEN startup removes it.
 
 ### Requirement: Cost receipts
 
-Each attempt SHALL append a receipt (task id, attempt number, worker, model, wall-clock elapsed, agent-reported tokens if available) to `state/receipts/` — every attempt end, including failed attempts (wall-clock truth, ADR-9). Receipts carry `outcome` (`"merged"` | `"failed"` | `"interrupted"` | `"recovered"`) and `error: Option<String>` — the first line of the attempt's failure reason, capped at 200 characters, `None` for merged attempts. Receipts written before this change SHALL deserialize with outcome `"merged"` and `error = None`. Receipts also carry `cost_micros` — the provider's OWN reported cost for the attempt, as integer MICRO-USD (so the ledger carries no float drift), recorded ONLY when the transcript's `usage.cost.total` is finite and STRICTLY POSITIVE: a reported `0` means "not tracked" (every provider tested here reports exactly 0, indistinguishable from a genuinely free run) and is recorded as `None`, never as a measured free run; a missing `cost`, a `cost` that is not an object, or a `total` that is a string, negative, or NaN is `None` as well. Receipts written before this change SHALL deserialize with `cost_micros = None`. `af cost` SHALL aggregate receipts (last run, since date, or per task).
+Each attempt SHALL append a receipt (task id, attempt number, worker, model, wall-clock elapsed, agent-reported tokens if available) to `state/receipts/` — every attempt end, including failed attempts (wall-clock truth, ADR-9). Receipts carry `outcome` (`"merged"` | `"failed"` | `"interrupted"` | `"recovered"`) and `error: Option<String>` — the first line of the attempt's failure reason, capped at 200 characters, `None` for merged attempts; EXCEPT for a failure whose reason begins `acceptance gate failed`, whose `error` SHALL be the LAST up to 200 characters of the gate's combined output (boundary-aware, whole lines), or the marker `(gate produced no output; exit N)` when the gate wrote nothing — so retry prompts and `af status` show the real reason at the END of the gate run, not its first banner line. Receipts written before this change SHALL deserialize with outcome `"merged"` and `error = None`. Receipts also carry `cost_micros` — the provider's OWN reported cost for the attempt, as integer MICRO-USD (so the ledger carries no float drift), recorded ONLY when the transcript's `usage.cost.total` is finite and STRICTLY POSITIVE: a reported `0` means "not tracked" (every provider tested here reports exactly 0, indistinguishable from a genuinely free run) and is recorded as `None`, never as a measured free run; a missing `cost`, a `cost` that is not an object, or a `total` that is a string, negative, or NaN is `None` as well. Receipts written before this change SHALL deserialize with `cost_micros = None`. `af cost` SHALL aggregate receipts (last run, since date, or per task).
 
 When startup heal finds a stale `running` attempt whose durable agent
 outcome cannot be resumed (it must re-run the agent — phase `Spawned`, a
@@ -122,6 +122,18 @@ THEN the `interrupted` receipt names that worker and its configured model, carri
 GIVEN a task left `running` by a killed orchestrator whose persisted state carries neither `attempt_worker` nor `attempt_started_ts`
 WHEN the next `af run` heals the stale attempt by re-running the agent
 THEN the `interrupted` receipt records worker `unknown` and `wall_clock_s` 0.0 with an `error` explaining the duration is unknown.
+
+#### Scenario: gate-failure receipts carry the failing tail
+
+GIVEN an agent whose change fails the acceptance gate (the gate's combined output ends in `YAML-FAIL k8s/openedusuite/deploy-drawio.yaml` after a long banner)
+WHEN the failed attempt's receipt is loaded
+THEN `error` starts with `acceptance gate failed (exit 1):` and ends with the gate output's last line `YAML-FAIL k8s/openedusuite/deploy-drawio.yaml`, not the banner's first line.
+
+#### Scenario: silent gate failure names the missing output
+
+GIVEN a gate that exits non-zero having printed nothing
+WHEN the failed attempt's receipt is loaded
+THEN `error` is `acceptance gate failed (exit N): (gate produced no output; exit N)`.
 
 ### Requirement: Recovered receipts
 

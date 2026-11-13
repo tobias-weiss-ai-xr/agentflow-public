@@ -68,6 +68,7 @@ fn cfg_of(tasks: Vec<Task>) -> Config {
         by_id,
         repos: BTreeMap::new(),
         warnings: vec![],
+        module_map: None,
     }
 }
 

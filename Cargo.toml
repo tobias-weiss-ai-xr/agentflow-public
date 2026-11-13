@@ -1,6 +1,6 @@
 [package]
 name = "agentflow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Parallel LLM task execution on isolated git worktrees"
 license = "MIT"

@@ -7,11 +7,21 @@ multiple LLM providers in parallel (via an OpenAI-compatible **agent CLI**),
 each running in an isolated git worktree. Tasks are verified against exact
 acceptance gates before being merged to the base branch.
 
-```
- tasks.json (N tasks, declarative)  ─┐
- workers.json (M providers)          ├──► af ──► per-task:
-                                      │         worktree → agent CLI → gate → merge
- env (AF_*)                          ─┘
+```mermaid
+flowchart LR
+    T["tasks.json<br/>N declarative tasks"] --> AF
+    W["workers.json<br/>M providers"] --> AF
+    E["env (AF_*)"] --> AF
+
+    AF["af run"] --> WT["Prepare<br/>fresh worktree + branch"]
+    WT --> A["Dispatch<br/>agent CLI · UCB1 routing"]
+    A --> G{"Verify<br/>accept gate"}
+    G -->|exit 0| M["Merge<br/>to base branch"]
+    G -->|fail · stall · timeout<br/>scope · conflict| AR["Archive<br/>branch-rejected-ts"]
+    M --> RC["receipt<br/>outcome · wall-clock · cost"]
+    AR --> RC
+    RC -->|Learn| UCB["trust + cost ledger<br/>→ next dispatch"]
+    UCB -.->|routes| A
 ```
 
 The orchestrator stays thin (ADR-1): it drives `git` and an OpenAI-compatible
@@ -170,8 +180,9 @@ the config files and state dir live under the current directory.
 | `AF_WORKTREE_ROOT` | Where task worktrees are created (`<state>/worktrees`) |
 | `AF_TASKS_JSON` | Tasks file (`config/tasks.json`) |
 | `AF_WORKERS_JSON` | Workers file (`config/workers.json`) |
+| `AF_PROMPT_FILE` | Prompt template file (default `prompts/worker.md`); re-read for every rendered prompt, so an edit takes effect on the next attempt. `{{TASK_ID}} {{TASK_TITLE}} {{SCOPE}} {{ACCEPTANCE}} {{ACCEPT_CMD}} {{MODEL}} {{PROVIDER}} {{CONTEXT}} {{PREVIOUS_ERROR}}` are substituted; `{{#CONTEXT}}…{{/CONTEXT}}` drops when the task declares no context. |
 | `AF_REPOS_JSON` | Multi-repo map for campaigns spanning several repos (falls back to `<tasks dir>/repos.json`) |
-| `AF_MAX_PARALLEL` | Cap on concurrently running tasks (`0` = one per enabled worker) |
+| `AF_MAX_PARALLEL` | Cap on concurrently running tasks. `0` (default) = one slot per currently-**enabled** worker, recomputed on every hot reload — append a worker to `workers.json` mid-run and the pool grows, set one `enabled: false` and it shrinks. A non-zero value is a fixed ceiling never recomputed. |
 | `AF_BRANCH_PREFIX` | Prefix for worktree branches (`tf`) |
 | `AF_POLL` | Poll interval of the run loop, in seconds (`15`) |
 | `AF_GATE_ENV` | Extra `K=V K2=V2 …` environment injected into `accept` gate commands (`""`) |
@@ -202,11 +213,11 @@ nix build .#image -o result-image         # docker image         → result-imag
 docker load < result-image
 docker run --rm -v "$AF_REPO_DIR":/repo -v "$PWD/config":/config \
     -e AF_REPO_DIR=/repo -e AF_STATE_DIR=/state \
-    agentflow:0.1.0 run --dry-run --tasks /config/tasks.json --workers /config/workers.json
+    agentflow:0.1.1 run --dry-run --tasks /config/tasks.json --workers /config/workers.json
 ```
 
 With the entrypoint set, everything after the image name is af arguments
-(`docker run agentflow:0.1.0 --version`).
+(`docker run agentflow:0.1.1 --version`).
 
 ## Versioning & releases
 
@@ -239,16 +250,10 @@ clean tree is exactly what prints the plain version.
 
 ### Prebuilt binaries
 
-`scripts/dist/` builds the per-architecture release binaries in a bookworm
-container (glibc ≥ 2.32):
-
-```sh
-bash scripts/dist/build-x64.sh     # → /tmp/af-dist/af-linux-x64
-bash scripts/dist/build-arm64.sh   # → /tmp/af-dist/af-linux-arm64
-```
-
 Every GitHub release ships both tarballs plus a `SHA256SUMS` file
-(`af-linux-x64-vX.Y.Z.tar.gz`, `af-linux-arm64-vX.Y.Z.tar.gz`). To install the
+(`af-linux-x64-vX.Y.Z.tar.gz`, `af-linux-arm64-vX.Y.Z.tar.gz`), built
+automatically by `.github/workflows/release.yml` when a `v*` tag is pushed
+(x64 native, arm64 via cargo-zigbuild with a glibc 2.31 baseline). To install the
 x86_64 build:
 
 ```sh
@@ -463,6 +468,33 @@ campaign) is reported by name with one `warning:` line — `af cost` and
 `af status` load receipts through the checked loader — and is never allowed
 to block the command: the readable history is still accounted for.
 
+## Campaign monitoring
+
+A running campaign needs no dashboard: the state dir (default `state`,
+override with `AF_STATE_DIR`) plus four read-only commands answer "where is
+my budget going?"
+
+| Command | What it tells you |
+|---------|-------------------|
+| `af status` | Per-task board over the state dir: state, attempt count, worker, branch — which tasks are running, done or failed (`--json` for scripts) |
+| `af attach ID` | Live follow of ONE task's agent: tails `state/logs/<id>.log` until the task reaches a terminal state (Ctrl-C detaches; the campaign keeps running) |
+| `af cost` | Spend ledger over `state/receipts/`: TOTAL seconds/tokens, the per-worker trust block (with an `INFRA` column when any worker has infra-class failures), and the `WASTED` breakdown grouping failed attempts by cause; `--task ID`, `--last`, `--since` narrow the window |
+| `af stop` | Cooperative stop: writes the stop flag into the state dir and SIGTERMs the pid from `af.pid` — in-flight attempts finish, `af run` then exits `3` (stopped early) |
+
+Beyond the board:
+
+- **Per-task logs** land in `state/logs/<task>.log` under the state dir —
+  the raw record to read when the board shows a task stuck or failed
+  (`af attach ID` is that file, streamed).
+- **Exit codes** of `af run`: `0` = done (every in-scope task reached
+  `done`), `2` = configuration error or deadlock (no task can make
+  progress), `3` = stopped early (`af stop`, or the wall-clock/token
+  budget cap was hit before every in-scope task started).
+- **Hot-reload**: `af run` re-reads the tasks/workers config files each
+  poll round when their mtimes change — a scope/accept fix reaches the next
+  retry without a restart; a broken file keeps the last good config and
+  warns once.
+
 ## Task schema (`config/tasks.json`)
 
 | Field | Description |
@@ -474,10 +506,11 @@ to block the command: the readable history is still accounted for.
 | `touch` | Optional declaration of the files you believe the task MUST edit; `af validate` rejects the config when one is covered by no `scope` entry (that task cannot pass) |
 | `accept` | Shell command run in the task's worktree; exit 0 = pass |
 | `acceptance_prose` | Natural-language success criteria (injected into the prompt) |
+| `context` | Optional per-task context injected into the prompt: a string, or an array of strings joined with newlines — rendered via `{{CONTEXT}}` (the `{{#CONTEXT}}…{{/CONTEXT}}` template section drops when unset). Craft the task's "mission" here — which conventions/sections of the repo to read, invariants to honor, prior failures to avoid — beyond the acceptance prose. Absent/`null`/empty = no context. |
 | `manual` | Skip the acceptance gate (manual sign-off) |
 | `priority` | Tie-breaker when multiple tasks are ready. **Higher sorts first** (`CRITICAL`=20 > `HIGH`=10 > `MEDIUM`=0 > `LOW`=-10; numbers keep their value). The "P1 = highest priority" convention is the OPPOSITE of af's scale — declare p1-tasks as `"priority": 10` (or `"HIGH"`), not `1`. |
 | `gate_replay` | Whether the gate is replay-safe (default `true`); `false` = side effects |
-| `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). Suggest 12-16 for write+commit+gate tasks; 6 is often too tight. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — evidence from receipts, so it survives `--resume`. Gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32-48+; keep the gate as narrow as the scope. |
+| `max_turns` | Per-task turn cap for builtin workers (overrides the worker's `max_turns`, then `AF_AGENT_MAX_TURNS`, then 32). **Evidence from 151 receipts: budget 24–32 for write+commit+gate tasks — 12–16 is demonstrably too tight** (turn-cap deaths at caps 14/16/22/24 on doc, readme, and config chores), and gate-heavy tasks (e.g. a whole-workspace `cargo clippy` in `accept`) need 32–48+; keep the gate as narrow as the scope. After a `turn cap N reached` failure, the retry automatically runs with `2 × N` (ceiling 128) — it survives `--resume`. |
 | `max_tokens` | Per-task token ceiling (default `0`/absent = no cap): before each dispatch af sums this task's receipts and, at/above the cap, marks the task `failed` with a reason naming the spend and the cap — no further agent runs for it. Composes with `AF_MAX_TOKENS`, `max_turns` and `max_attempts`. |
 | `readonly` | `true` = investigation-only: the builtin harness rejects `write`/`edit`, the attempt counts done on a normal agent stop (no gate, no merge) |
 | `cascade` | Ordered list of worker names tried CHEAPEST-FIRST across attempts: attempt 1 runs `cascade[0]`, attempt 2 escalates to `cascade[1]`, and so on — a hard task pays only the escalation it needs. When the attempt is past the cascade, the worker is busy, or it is disabled, af falls back to normal UCB1 routing. An explicit `--worker` pin overrides the cascade. The acceptance gate stays the sole arbiter (a cascade only changes WHO is dispatched). Validation rejects unknown worker names, duplicates, and an empty array. |
@@ -514,6 +547,24 @@ limits; since the agent run dominates a campaign's cost, an unexplained
 pause per retry is otherwise pure added wall-clock, so `0` (no delay) is
 the default and a campaign that wants backoff sets it explicitly.
 
+**Gate-failure defect detection**: when two independent agent-driven
+attempts of the same task die at the acceptance gate with byte-identical
+output (same exit code, same failing tail), `af run` marks the task
+`failed` immediately with reason `repeated identical gate failure (…) —
+task design defect`, stopping further retries. Gate-only reruns (re-runs
+of the same committed work, wall-clock < 5 s with no agent turns) are
+skipped as comparison targets — only two INDEPENDENT agent runs producing
+identical gate output trigger the stop. The detection uses persisted
+receipts, so it survives crash and resume.
+
+**Adaptive per-worker backoff**: a worker whose attempt fails as
+infrastructure (`failure_class: "infra"` — provider 4xx/5xx, rate limit,
+transport/harness timeout) is cooled down before it can be picked again,
+escalating 30 s → 60 s → 120 s → 240 s → 300 s ceiling. Any verdict
+(merged, verified, or non-infra failed) resets the escalation to level 0.
+A solo worker (only one enabled) is capped at 30 s so the campaign keeps
+retrying rather than idling for minutes.
+
 Tasks accept an optional `repo` field: `""` (default) or `"main"` target the
 main repo (`AF_REPO_DIR`); other names must appear in `repos.json` (next to
 tasks.json or via `--repos`/`AF_REPOS_JSON`) — e.g.
@@ -532,6 +583,34 @@ working unchanged. A declared value must be finite and positive — otherwise
 loading fails with an error naming the worker and the field — and an
 enabled worker declaring neither field gets a one-line warning at load time
 (cost estimates will be neutral for it); a disabled worker never warns.
+
+### Cost basis
+
+Both fields are optional per-worker and are the operator's declaration —
+agentflow never guesses a model's size from its name. `price_per_mtok_usd`
+is a flat USD price per million tokens (blended input+output): estimates for
+that worker come out as real dollars. `params_b` declares a params-based
+basis (model size in billions of parameters): a proxy for expense that gives
+provably-reproducible RELATIVE estimates (`N.NNx` ratios, never `$`). A
+declared price beats the `params_b` proxy: if a worker declares both, the
+price is used and the size is ignored. The values below are illustrative
+examples, not real quotes:
+
+```json
+// config/workers.json (excerpt)
+{ "workers": [
+  { "name": "turbo", "provider": "openai", "model": "turbo-latest",
+    "price_per_mtok_usd": 0.11 },  // EXAMPLE — turbo-tier flat price, blended $/Mtok
+  { "name": "glm", "provider": "zai", "model": "glm-5.2",
+    "params_b": 355 }              // params proxy instead of a price
+] }
+```
+
+When an ENABLED worker declares neither field, `af validate` (and every
+config load) prints `worker <name> has no cost basis (params_b or
+price_per_mtok_usd): cost estimates will be neutral for it` (disabled
+workers never warn), and `af cost` then shows `-` in that worker's COST
+column because there is no basis to price its tokens with.
 
 ## Sandboxing
 

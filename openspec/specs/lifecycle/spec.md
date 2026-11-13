@@ -45,12 +45,30 @@ THEN the process is killed, the attempt fails, and no merge happens.
 
 ### Requirement: Prompt rendering
 
-A task prompt SHALL be rendered from `prompts/worker.md` with the task's `title`, `id`, `scope`, and `acceptance_prose` substituted, and written to a file passed to the agent CLI. For attempt ≥ 2, the rendered prompt SHALL also include a "Previous attempts" block listing this task's earlier failed attempts (attempt number + error line) so the agent avoids repeating them. Attempt 1 SHALL render without the block.
+A task prompt SHALL be rendered from the configured prompt template — `prompts/worker.md` by default, or the file named by `AF_PROMPT_FILE` — with the task's `title`, `id`, `scope`, `acceptance_prose`, and `context` substituted, and written to a file passed to the agent CLI. The `{{CONTEXT}}` placeholder SHALL be replaced with the task's context (empty when the task declares none); a `{{#CONTEXT}}…{{/CONTEXT}}` conditional section in the template SHALL drop entirely when the task declares no context and render otherwise. For attempt ≥ 2, the rendered prompt SHALL also include a "Previous attempts" block listing this task's earlier failed attempts (attempt number + error line) so the agent avoids repeating them: when the template carries the `{{PREVIOUS_ERROR}}` token the block is substituted into it, otherwise it is appended to the prompt. Attempt 1 SHALL render without the block (the `{{PREVIOUS_ERROR}}` token, if any, renders empty). A configured template that omits `{{CONTEXT}}` for a task that declares context SHALL have the context appended as a "Task context" section (with a warning), so crafted context is never silently dropped. The template file SHALL be re-read for every rendered prompt, so an edited template takes effect on the next attempt without a restart.
 
 #### Scenario: template substitution
 
 WHEN a task with title and acceptance prose is dispatched
 THEN the rendered prompt file contains the task title and acceptance prose.
+
+#### Scenario: task context is injected
+
+GIVEN a task declaring `context: "read docs/CONVENTIONS.md first"`
+WHEN the prompt renders from a template containing `{{CONTEXT}}`
+THEN the rendered prompt contains that exact context in place of the placeholder.
+
+#### Scenario: conditional context section vanishes when unset
+
+GIVEN a template containing `{{#CONTEXT}}Remember:{{CONTEXT}}{{/CONTEXT}}`
+WHEN a task without context renders
+THEN neither `{{#CONTEXT}}`, `{{CONTEXT}}`, nor the surrounding section text appears in the prompt.
+
+#### Scenario: a task-context template that omits the placeholder is repaired
+
+GIVEN a task with context and a custom template that contains no `{{CONTEXT}}`
+WHEN the prompt renders
+THEN the context appears as an appended `## Task context` section and a warning names the template.
 
 #### Scenario: retry prompt names the earlier failure
 
@@ -62,7 +80,13 @@ THEN the prompt contains a previous-attempts entry for attempt 1.
 
 GIVEN a task dispatching its first attempt
 WHEN the prompt renders
-THEN no previous-attempts block appears.
+THEN no previous-attempts block appears (and the `{{PREVIOUS_ERROR}}` token, if any, renders empty).
+
+#### Scenario: custom template is selected per campaign
+
+GIVEN `AF_PROMPT_FILE` names a template that is otherwise complete but omits the exact gate command
+WHEN a prompt renders
+THEN the template is used and the auto-append hardening still adds the missing gate command section.
 
 ### Requirement: Gate replay contract
 
@@ -406,13 +430,37 @@ before (task override → worker field → `TF_AGENT_MAX_TURNS` → 32).
 Each dispatch round of `af run` SHALL be planned against the current
 tasks/workers files (mtime-gated hot reload), and a reload failure SHALL
 degrade to the last good config with a single warning, never to a campaign
-abort.
+abort. When the operator left the parallel ceiling to the default
+(`AF_MAX_PARALLEL` unset or `0`), the pool capacity for a round SHALL be
+recomputed from the reloaded config's enabled-worker count, so adding or
+disabling workers while the campaign runs grows or shrinks the pool on the
+fly; an explicit `AF_MAX_PARALLEL` SHALL remain a fixed ceiling across
+reloads. In-flight attempts finish on the worker they started and are
+unaffected by either change.
 
 #### Scenario: hot reload refreshes ExecCtx for dispatch
 
 - Given a campaign mid-run
 - When the workers file changes (e.g. a worker is disabled) between rounds
 - Then subsequent dispatch picks reflect the change without a restart
+
+#### Scenario: adding a worker mid-run grows the pool
+
+- Given a campaign launched with the default ceiling (AF_MAX_PARALLEL unset) and two enabled workers
+- When a third worker is appended to workers.json while `af run` is running
+- Then the next dispatch round runs with a pool capacity of three, so three disjoint-scope tasks may run concurrently
+
+#### Scenario: disabling a worker mid-run shrinks the pool
+
+- Given a campaign launched with the default ceiling and three enabled workers
+- When one worker is set `enabled: false` while `af run` is running
+- Then the next dispatch round runs with a pool capacity of two and no new attempt is routed to the disabled worker
+
+#### Scenario: an explicit ceiling stays fixed
+
+- Given a campaign launched with `AF_MAX_PARALLEL=4` and two enabled workers
+- When a third worker is appended to workers.json while `af run` is running
+- Then the pool capacity remains four (the operator's explicit ceiling is never recomputed)
 
 (Shared scenarios for failure handling live in the config delta.)
 
@@ -446,3 +494,47 @@ the existing startup heal.
 - When the run loop panics
 - Then the panic message and location are appended to `<state dir>/crash.log`
 - And the default panic output is preserved
+
+### Requirement: Gate-failure defect detection
+
+When a task's most recent AGENT-driven attempt (one that ran the agent, not a gate-only rerun) dies at the acceptance gate, `af run` SHALL compare its gate-error fingerprint to the fingerprint of the previous AGENT-driven gate-failed attempt of the same task. The fingerprint is the pair (exit code, whitespace-normalized tail) of the gate output as recorded on the receipt. When the two fingerprints are IDENTICAL and the task has at least two attempts recorded, `af` SHALL mark the task `failed` immediately — even while attempts remain under the retry budget — with the reason `repeated identical gate failure (<tail>) — task design defect`, persist it, print the early stop, and SHALL NOT dispatch further attempts for that task. A differing fingerprint (a flake, or an agent whose new work moved the gate's failure) SHALL fall through to the normal retry decision unchanged. Gate-only reruns (re-runs of the same committed work) SHALL NOT be used as comparison targets, so an identical result from re-running a single branch never triggers the stop by itself. The persisted receipts are the only evidence used, so the detection survives crash and resume.
+
+#### Scenario: identical gate failure stops before the retry budget
+
+GIVEN a task whose attempt 1 (a full agent run) dies at the gate with `PARSE-FAIL nix/…`, whose attempt 3 (another full agent run, after the cheap gate rerun of attempt 2) dies with the same `PARSE-FAIL` tail and exit code
+WHEN attempt 3 is reaped
+THEN the task is marked `failed` with reason `repeated identical gate failure (…) — task design defect`, even though `max_attempts` has not been reached, and no attempt 4 is dispatched.
+
+#### Scenario: a different fingerprint retries normally
+
+GIVEN a task whose attempt 1 dies at the gate with reason A and attempt 2 (fresh agent) dies with reason B (the agent changed the files the gate checks)
+WHEN attempt 2 is reaped
+THEN the task stays in retry flow and attempt 3 may still be dispatched.
+
+#### Scenario: a gate-only rerun never triggers alone
+
+GIVEN a task whose attempt 1 failed at the gate and attempt 2 was only a cheap gate rerun of the same committed work (no agent), failing identically by construction
+WHEN attempt 2 is reaped
+THEN no early stop fires (the comparison target must be a full agent-driven attempt with new work).
+
+#### Scenario: detection survives resume
+
+GIVEN a task whose two agent-driven attempts both died at the gate with identical fingerprints, split across two `af run` invocations
+WHEN the second run reaps the later attempt
+THEN the receipts persisted by the first run still trigger the early stop.
+
+### Requirement: Retry prompts reuse the gate-failure receipt
+
+The "Previous attempts" block in a retry prompt SHALL quote the receipt's `error` verbatim. Because gate-failure receipts now carry the Failing tail of the gate output (see the state delta), a task retried after a gate failure SHALL present that tail — the last lines the gate printed — to the next agent, so the agent is told why the gate rejected its work rather than shown a banner or an empty line. This is the ADR-13 mechanism unchanged; it only consumes the improved receipt content.
+
+#### Scenario: retry prompt shows the gate's failing line
+
+GIVEN a task whose only failed attempt died at the gate with a trailing `YAML-FAIL k8s/openedusuite/deploy-drawio.yaml` line
+WHEN attempt 2 renders its "Previous attempts" block
+THEN the block contains that trailing line, exactly as recorded on the receipt.
+
+#### Scenario: first attempt and non-gate failures are unchanged
+
+GIVEN a task whose attempt 1 failed on a provider timeout (no gate)
+WHEN attempt 2 renders
+THEN the block quotes the timeout's first line as before, and a first attempt renders no block at all.

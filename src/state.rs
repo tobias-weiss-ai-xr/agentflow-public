@@ -130,8 +130,12 @@ pub struct Receipt {
     pub ts: u64,
     #[serde(default = "default_outcome")]
     pub outcome: String,
-    /// First line of the failure reason (≤200 chars); None on merged/verified
-    /// attempts and for legacy receipts.
+    /// Failure reason for the receipt. For gate failures (`acceptance gate
+    /// failed (exit N): …`) this is the TAIL of the gate's combined output
+    /// (last ≤200 chars, on line boundaries) so retry prompts show why the
+    /// gate rejected the work, not the banner's first line; for every other
+    /// failure it is the first line of the reason (≤200 chars). `None` on
+    /// merged/verified attempts and for legacy receipts.
     #[serde(default)]
     pub error: Option<String>,
     /// The provider's OWN reported cost for this attempt, in MICRO-USD

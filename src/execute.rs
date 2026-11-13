@@ -142,6 +142,68 @@ pub fn classify_failure(error: &str) -> &'static str {
     "agent"
 }
 
+/// Truncate a gate-failure reason to the TAIL of the gate's combined
+/// output (last ≤200 chars, on line boundaries) so retry prompts and
+/// `af status` show why the gate rejected the work, not the banner's
+/// first line. Returns `None` for non-gate errors (the caller keeps the
+/// first-line rule).
+///
+/// The `; work kept on branch <name>` suffix appended by
+/// `preserve_and_note` is retry metadata, not gate output — it is stripped
+/// before the tail is taken. When the gate wrote nothing, the marker
+/// `(gate produced no output; exit N)` replaces the empty body.
+fn gate_error_tail(error: &str) -> Option<String> {
+    const PREFIX: &str = "acceptance gate failed";
+    if !error.starts_with(PREFIX) {
+        return None;
+    }
+    // Parse "acceptance gate failed (exit N): <body>"
+    let rest = &error[PREFIX.len()..]; // " (exit N): <body>"
+    let exit_code = rest
+        .strip_prefix(" (exit ")
+        .and_then(|s| s.split(')').next())
+        .unwrap_or("-");
+    // The body is everything after ": ". It may end with a
+    // "; work kept on branch <name>" suffix (from preserve_and_note)
+    // that is NOT gate output — strip it before taking the tail.
+    let body = rest.find(": ").map(|i| &rest[i + 2..]).unwrap_or("");
+    let combined = body
+        .rsplit_once("; work kept on branch ")
+        .map(|(head, _)| head)
+        .unwrap_or(body);
+    let tail = tail_of_gate_output(combined.trim());
+    let body_text = if tail.is_empty() {
+        format!("(gate produced no output; exit {})", exit_code)
+    } else {
+        tail
+    };
+    Some(format!(
+        "acceptance gate failed (exit {}): {}",
+        exit_code, body_text
+    ))
+}
+
+/// Last ≤200 chars of the gate's combined output, folded to whole lines.
+/// Empty input returns an empty string (the caller substitutes the marker).
+fn tail_of_gate_output(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 200 {
+        return s.to_string();
+    }
+    // Last 200 chars, then drop the partial first line.
+    let start = chars.len() - 200;
+    let tail: String = chars[start..].iter().collect();
+    if let Some(pos) = tail.find('\n') {
+        tail[pos + 1..].to_string()
+    } else {
+        // No newline in the last 200 chars — use as-is (a single very long line).
+        tail
+    }
+}
+
 pub fn execute_task(
     ctx: &ExecCtx,
     worker: &Worker,
@@ -154,7 +216,14 @@ pub fn execute_task(
     // Receipt for EVERY attempt (merged + failed) — routing/cost substrate.
     let outcome_name = outcome_name(&outcome);
     let error = match &outcome {
-        Outcome::Failed(e) => Some(e.lines().next().unwrap_or("").chars().take(200).collect()),
+        Outcome::Failed(e) => Some(gate_error_tail(e).unwrap_or_else(|| {
+            e.lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect::<String>()
+        })),
         Outcome::Merged | Outcome::Verified => None,
     };
     // Failure class (infra vs agent) from the FULL reason before truncation,
@@ -1064,6 +1133,9 @@ Acceptance gate command (run verbatim to verify this task):
 {{ACCEPT_CMD}}
 
 Work on TASK_ID only. Do not touch files outside the allowed scope.
+{{#CONTEXT}}Task context:
+{{CONTEXT}}
+{{/CONTEXT}}{{PREVIOUS_ERROR}}
 When done, make sure the acceptance criteria hold and your changes are
 committed on the current branch."#;
 
@@ -1096,6 +1168,20 @@ pub fn render_prompt(
         .accept
         .clone()
         .unwrap_or_else(|| "(no acceptance gate command — manual task)".to_string());
+    // Per-task crafted context (the operator's "mission" beyond the
+    // acceptance prose): replaces `{{CONTEXT}}`; empty when the task
+    // declares none. The `{{#CONTEXT}}…{{/CONTEXT}}` conditional section
+    // drops entirely when unset.
+    let task_context = task
+        .context
+        .as_ref()
+        .map(crate::config::TaskContext::rendered);
+    let has_context = task_context.as_ref().is_some_and(|c| !c.is_empty());
+    // ADR-13 retry memory: the previous-attempts block. When the template
+    // carries `{{PREVIOUS_ERROR}}` it is substituted INTO the token;
+    // otherwise the block is appended at the end (legacy placement).
+    // Attempt 1 has no block, so the token renders empty.
+    let previous_error = context.unwrap_or("");
     let map = [
         ("{{TASK_ID}}", task.id.as_str()),
         ("{{TASK_TITLE}}", task.title.as_str()),
@@ -1104,11 +1190,14 @@ pub fn render_prompt(
         ("{{ACCEPT_CMD}}", &accept_cmd),
         ("{{MODEL}}", worker.model.as_str()),
         ("{{PROVIDER}}", worker.provider.as_str()),
+        ("{{CONTEXT}}", task_context.as_deref().unwrap_or("")),
+        ("{{PREVIOUS_ERROR}}", previous_error),
     ];
     let mut out = template.to_string();
     for (k, v) in map {
         out = out.replace(k, v);
     }
+    out = render_conditional_section(&out, "CONTEXT", has_context);
     out = strip_scope_markers(&out);
 
     // Hardening: a configured template that omits a placeholder would
@@ -1143,11 +1232,29 @@ pub fn render_prompt(
                 "\n\n## Acceptance gate command (auto-appended)\n{accept_cmd}\n"
             ));
         }
+        if has_context && !tpl.contains("{{CONTEXT}}") {
+            eprintln!(
+                "af: warning: prompt template {} omits {{{{CONTEXT}}}} — appending task context",
+                st.prompt_file.display()
+            );
+            out.push_str(&format!(
+                "\n\n## Task context (auto-appended)\n{}\n",
+                task_context.as_deref().unwrap_or("")
+            ));
+        }
     }
 
-    if let Some(ctx) = context {
-        out.push_str(ctx);
+    // PREVIOUS_ERROR fallback: a template WITHOUT the token (including the
+    // built-in historical behaviour) still gets the failure block appended
+    // at the end — attempt 1 has no block, so nothing is appended.
+    if !previous_error.is_empty()
+        && custom
+            .as_ref()
+            .is_none_or(|t| !t.contains("{{PREVIOUS_ERROR}}"))
+    {
+        out.push_str(previous_error);
     }
+
     out
 }
 
@@ -1170,6 +1277,67 @@ fn strip_scope_markers(rendered: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Fold a `{{#NAME}}…{{/NAME}}` conditional section of a rendered prompt.
+/// When `active` the two marker tokens are removed and the section's
+/// content kept (the image of `strip_scope_markers` for an extra marker);
+/// when `inactive` the WHOLE region — markers and content — is dropped, so
+/// a code path that has nothing to contribute cannot leave a half-empty
+/// labelled section (e.g. a task declaring no context still renders a
+/// clean `{{CONTEXT}}`-less prompt). Applied to the rendered text AFTER
+/// placeholder substitution, so the map-replaced `{{CONTEXT}}` value is
+/// what the section contains (or empty). An unbalanced marker pair keeps
+/// the remainder verbatim minus the opening marker — a hostile template
+/// must never crash the renderer.
+fn render_conditional_section(rendered: &str, name: &str, active: bool) -> String {
+    let open = format!("{{{{#{name}}}}}");
+    let close = format!("{{{{/{name}}}}}");
+    if active {
+        rendered
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t != open && t != close
+            })
+            .map(|l| l.replace(&open, "").replace(&close, ""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + if rendered.ends_with('\n') { "\n" } else { "" }
+    } else {
+        let mut out = String::new();
+        let mut rest = rendered;
+        loop {
+            match rest.find(&open) {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some(i) => {
+                    out.push_str(&rest[..i]);
+                    rest = &rest[i + open.len()..];
+                    match rest.find(&close) {
+                        // Unbalanced: keep everything after the open marker.
+                        None => {
+                            out.push_str(rest);
+                            break;
+                        }
+                        Some(j) => {
+                            // Consume through the END of the close marker's
+                            // line (whole-line sections and inline ones
+                            // both collapse cleanly to the next line).
+                            let after = &rest[j + close.len()..];
+                            rest = match after.find('\n') {
+                                Some(k) => &after[k + 1..],
+                                None => "",
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1395,6 +1563,45 @@ mod tests {
         assert!(ctx.contains("attempt 2: gate failed (exit 1)"));
         assert!(!ctx.contains("other task"), "other tasks excluded");
         assert!(!ctx.contains("merged"), "merged attempts excluded");
+    }
+
+    #[test]
+    // spec: lifecycle/retry-prompts-reuse-the-gate-failure-receipt#retry-prompt-shows-the-gate-s-failing-line
+    fn failure_context_shows_gate_failing_tail() {
+        // A gate-failure receipt carries the failing tail (change A), and
+        // the retry prompt's "Previous attempts" block quotes it verbatim.
+        let rs = vec![receipt_of(
+            "A",
+            1,
+            "failed",
+            Some("acceptance gate failed (exit 1): YAML-FAIL k8s/openedusuite/deploy-drawio.yaml"),
+        )];
+        let ctx = failure_context(&rs, "A", 2).unwrap();
+        assert!(
+            ctx.contains("YAML-FAIL k8s/openedusuite/deploy-drawio.yaml"),
+            "retry prompt shows the gate's failing line: {ctx}"
+        );
+        assert!(
+            ctx.contains("acceptance gate failed (exit 1)"),
+            "retry prompt shows the gate exit code: {ctx}"
+        );
+    }
+
+    #[test]
+    // spec: lifecycle/retry-prompts-reuse-the-gate-failure-receipt#first-attempt-and-non-gate-failures-are-unchanged
+    fn failure_context_first_attempt_has_no_block_for_gate_failure() {
+        // A first attempt renders no "Previous attempts" block at all,
+        // even when the failure is a gate failure.
+        let rs = vec![receipt_of(
+            "A",
+            1,
+            "failed",
+            Some("acceptance gate failed (exit 1): YAML-FAIL"),
+        )];
+        assert!(
+            failure_context(&rs, "A", 1).is_none(),
+            "first attempt renders no previous-attempts block"
+        );
     }
 
     fn receipt_with_contracts(
@@ -1794,5 +2001,272 @@ b.md"
             "gate command appended even though template omits {{ACCEPT_CMD}}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#task-context-is-injected
+    fn render_prompt_injects_task_context() {
+        use crate::config::TaskContext;
+        let task = crate::config::Task {
+            id: "C1".into(),
+            title: "context task".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            context: Some(TaskContext::Text("read docs/CONVENTIONS.md first".into())),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-ctx-inj-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tpl = dir.join("tpl.md");
+        std::fs::write(&tpl, "## Context\n{{CONTEXT}}\n").unwrap();
+        let out = render_prompt(&settings_with_prompt_file(tpl), &task, &worker(None), None);
+        assert!(
+            out.contains("read docs/CONVENTIONS.md first"),
+            "{{CONTEXT}} must be replaced by the task's context"
+        );
+        assert!(!out.contains("{{CONTEXT}}"), "no placeholder may leak");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#conditional-context-section-vanishes-when-unset
+    fn render_prompt_conditional_context_section_drops_when_unset() {
+        let task = crate::config::Task {
+            id: "C2".into(),
+            title: "no context".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            // context deliberately absent
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-ctx-drop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tpl = dir.join("tpl.md");
+        std::fs::write(
+            &tpl,
+            "Task header\n{{#CONTEXT}}Remember:{{CONTEXT}}{{/CONTEXT}}\ntail\n",
+        )
+        .unwrap();
+        let out = render_prompt(&settings_with_prompt_file(tpl), &task, &worker(None), None);
+        assert!(
+            !out.contains("{{#CONTEXT}}"),
+            "opening conditional marker must not leak"
+        );
+        assert!(
+            !out.contains("{{/CONTEXT}}"),
+            "closing conditional marker must not leak"
+        );
+        assert!(
+            !out.contains("Remember:"),
+            "the whole section drops when the task declares no context"
+        );
+        assert!(
+            out.contains("Task header") && out.contains("tail"),
+            "rest preserved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#conditional-context-section-vanishes-when-unset
+    fn render_prompt_conditional_context_section_stays_when_set() {
+        use crate::config::TaskContext;
+        let task = crate::config::Task {
+            id: "C3".into(),
+            title: "with context".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            context: Some(TaskContext::Text("read CONVENTIONS".into())),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-ctx-keep-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tpl = dir.join("tpl.md");
+        std::fs::write(&tpl, "{{#CONTEXT}}Remember:{{CONTEXT}}{{/CONTEXT}}\n").unwrap();
+        let out = render_prompt(&settings_with_prompt_file(tpl), &task, &worker(None), None);
+        assert!(
+            out.contains("Remember:read CONVENTIONS"),
+            "active section keeps its content with the context substituted"
+        );
+        assert!(
+            !out.contains("{{#CONTEXT}}") && !out.contains("{{/CONTEXT}}"),
+            "markers stripped when active"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#a-task-context-template-that-omits-the-placeholder-is-repaired
+    fn render_prompt_appends_task_context_when_template_omits_placeholder() {
+        use crate::config::TaskContext;
+        let task = crate::config::Task {
+            id: "C4".into(),
+            title: "context task".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            context: Some(TaskContext::Text("no placeholder here".into())),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-ctx-append-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Template carries NO {{CONTEXT}} — the context must not be dropped.
+        let tpl = dir.join("bare.md");
+        std::fs::write(&tpl, "Task {{TASK_ID}}: {{TASK_TITLE}}\n").unwrap();
+        let out = render_prompt(
+            &settings_with_prompt_file(tpl.clone()),
+            &task,
+            &worker(None),
+            None,
+        );
+        assert!(
+            out.contains("## Task context") && out.contains("no placeholder here"),
+            "context appended as a Task context section"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#retry-prompt-names-the-earlier-failure
+    fn render_prompt_previous_error_substitutes_into_token() {
+        let task = crate::config::Task {
+            id: "P1".into(),
+            title: "retry".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-prev-inj-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tpl = dir.join("tpl.md");
+        // Token SITS in the middle of the template: substitution must land
+        // THERE, not be double-appended at the end.
+        std::fs::write(&tpl, "Head\n{{PREVIOUS_ERROR}}\nFoot\n").unwrap();
+        let block = "\n## Previous attempts\n- attempt 1: gate boom\n";
+        let out = render_prompt(
+            &settings_with_prompt_file(tpl),
+            &task,
+            &worker(None),
+            Some(block),
+        );
+        assert!(out.contains("Head\n"), "head preserved");
+        assert!(out.contains("attempt 1: gate boom"), "block substituted");
+        assert!(out.contains("\nFoot\n"), "foot preserved after the block");
+        assert!(!out.contains("{{PREVIOUS_ERROR}}"), "no token may leak");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // spec: lifecycle/prompt-rendering#first-attempt-has-no-history-block
+    fn render_prompt_previous_error_renders_empty_on_first_attempt() {
+        let task = crate::config::Task {
+            id: "P2".into(),
+            title: "first try".into(),
+            scope: vec!["src/lib.rs".into()],
+            accept: Some("true".into()),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("af-prev-none-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tpl = dir.join("tpl.md");
+        std::fs::write(&tpl, "Head\n{{PREVIOUS_ERROR}}\nFoot\n").unwrap();
+        // Attempt 1: no failure block at all (None).
+        let out = render_prompt(&settings_with_prompt_file(tpl), &task, &worker(None), None);
+        assert!(
+            !out.contains("{{PREVIOUS_ERROR}}"),
+            "token renders empty on attempt 1"
+        );
+        assert!(!out.contains("Previous attempts"), "no history block");
+        assert!(out.contains("Head\n\nFoot\n") || out.contains("Head") && out.contains("Foot"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- gate_error_tail (A: receipt tail) ---
+
+    #[test]
+    // spec: state/cost-receipts#gate-failure-receipts-carry-the-failing-tail
+    fn gate_error_tail_returns_last_line_of_gate_output() {
+        let banner =
+            "warning: ".to_string() + &"x".repeat(120) + "\n" + "warning: " + &"y".repeat(120);
+        let combined = format!("{banner}\nYAML-FAIL k8s/openedusuite/deploy-drawio.yaml");
+        let err = format!("acceptance gate failed (exit 1): {}", combined);
+        let tail = gate_error_tail(&err).expect("gate failure");
+        assert!(
+            tail.starts_with("acceptance gate failed (exit 1):"),
+            "prefix preserved: {tail}"
+        );
+        assert!(
+            tail.ends_with("YAML-FAIL k8s/openedusuite/deploy-drawio.yaml"),
+            "tail is the last line, not the banner: {tail}"
+        );
+        assert!(!tail.contains("warning: xxxxx"), "banner dropped");
+    }
+
+    #[test]
+    // spec: state/cost-receipts#gate-failure-receipts-carry-the-failing-tail
+    fn gate_error_tail_folds_to_200_chars_on_line_boundaries() {
+        let line = "x".repeat(80);
+        let combined = format!("{line}\n{line}\n{line}\nYAML-FAIL final");
+        let err = format!("acceptance gate failed (exit 1): {}", combined);
+        let tail = gate_error_tail(&err).expect("gate failure");
+        let body = tail
+            .strip_prefix("acceptance gate failed (exit 1): ")
+            .unwrap();
+        assert!(
+            body.chars().count() <= 200,
+            "body ≤200 chars: {}",
+            body.chars().count()
+        );
+        assert!(
+            body.starts_with('x'),
+            "folded to a line boundary, not mid-line"
+        );
+        assert!(body.ends_with("YAML-FAIL final"), "last line preserved");
+    }
+
+    #[test]
+    // spec: state/cost-receipts#silent-gate-failure-names-the-missing-output
+    fn gate_error_tail_returns_marker_for_empty_output() {
+        let err = "acceptance gate failed (exit 1):";
+        let tail = gate_error_tail(err).expect("gate failure");
+        assert_eq!(
+            tail,
+            "acceptance gate failed (exit 1): (gate produced no output; exit 1)"
+        );
+    }
+
+    #[test]
+    fn gate_error_tail_returns_none_for_non_gate() {
+        assert!(gate_error_tail("harness: turn cap 16 reached").is_none());
+        assert!(gate_error_tail("provider error: 429 rate limit").is_none());
+        assert!(gate_error_tail("").is_none());
+    }
+
+    #[test]
+    fn gate_error_tail_strips_work_kept_suffix() {
+        let combined = "YAML-FAIL k8s/openedusuite/deploy-drawio.yaml";
+        let err = format!(
+            "acceptance gate failed (exit 1): {}; work kept on branch tf/T1-3",
+            combined
+        );
+        let tail = gate_error_tail(&err).expect("gate failure");
+        assert!(
+            tail.ends_with("YAML-FAIL k8s/openedusuite/deploy-drawio.yaml"),
+            "kept suffix stripped, tail is the gate output: {tail}"
+        );
+        assert!(
+            !tail.contains("work kept on branch"),
+            "kept suffix not in tail"
+        );
+    }
+
+    #[test]
+    // spec: state/cost-receipts#gate-failure-receipts-carry-the-failing-tail
+    fn gate_error_tail_preserves_exit_code_dash() {
+        let err = "acceptance gate failed (exit -): something went wrong";
+        let tail = gate_error_tail(err).expect("gate failure");
+        assert!(
+            tail.starts_with("acceptance gate failed (exit -):"),
+            "dash exit code preserved: {tail}"
+        );
     }
 }

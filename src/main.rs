@@ -2,7 +2,7 @@
 
 use agentflow::config::{self, Settings};
 use agentflow::run::{self, RunOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -443,6 +443,18 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            // ADR-16 (code-graph-assisted task scoping): with a declared AND
+            // parseable module map, warn when two tasks' scopes are
+            // call-connected — semantic contention textual scope globs cannot
+            // see. Best-effort: if the map becomes unreadable/invalid between
+            // load and here the check silently degrades to a no-op
+            // (config::load already warned about the stale declaration).
+            let mut cfg = cfg;
+            let contention = module_map_contention_warnings(&cfg);
+            cfg.warnings.extend(contention.iter().cloned());
+            for w in &contention {
+                eprintln!("{w}");
+            }
             let enabled = cfg.workers.iter().filter(|w| w.enabled).count();
             println!(
                 "config OK: {} task(s), {} worker(s), {} enabled, {} warning(s)",
@@ -459,6 +471,85 @@ fn main() -> ExitCode {
         }
     };
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+// ---------------------------------------------------------------------------
+// ADR-16: semantic-contention check (module map consumed by `af validate`)
+// ---------------------------------------------------------------------------
+
+/// One directed call edge from the module map (file-level, see
+/// docs/module-map.md). Direction matters: `(A → B)` is distinct from
+/// `(B → A)`, but the contention check is symmetric over task pairs.
+type CallEdge = (String, String);
+
+/// Parse the call edges out of a module map (docs/module-map.md schema:
+/// `{"files": [...], "functions": [...], "calls": [{"from","to"}, ...]}`).
+/// Only `calls` is consumed here; `files`/`functions` are decorative for
+/// validation. Entries missing either endpoint are skipped (a producer
+/// bug must not crash a pre-flight check); duplicate edges are collapsed
+/// downstream because the contention check treats edges as a set.
+fn module_map_call_edges(path: &Path) -> Result<Vec<CallEdge>, String> {
+    let body = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let mut edges = Vec::new();
+    if let Some(calls) = v.get("calls").and_then(|c| c.as_array()) {
+        for c in calls {
+            if let (Some(from), Some(to)) = (
+                c.get("from").and_then(|f| f.as_str()),
+                c.get("to").and_then(|t| t.as_str()),
+            ) {
+                edges.push((from.to_string(), to.to_string()));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// True when `file` is allowed by any entry of `scope`. Uses the SAME
+/// matcher as admission control and enforcement
+/// (`agentflow::scheduler::scope_overlap` — the repo has exactly one glob
+/// implementation, see `config::validate`'s touch-coverage rule). An EMPTY
+/// `scope` means "any file" (existing semantics), so a scope-less task is
+/// call-connected to everything the map knows about.
+fn scope_hits(scope: &[String], file: &str) -> bool {
+    scope
+        .iter()
+        .any(|s| agentflow::scheduler::scope_overlap(file, s))
+}
+
+/// ADR-16 semantic contention: for every unordered pair of tasks, a call
+/// edge `(from → to)` connects them when one task's scope hits `from` and
+/// the other's hits `to` (in either direction). Returns one warning line
+/// per (pair, edge), sorted for deterministic output (pairs and edges are
+/// visited in config order, but a campaign's module map is produced by an
+/// external tool whose edge order is not guaranteed).
+fn module_map_contention_warnings(cfg: &config::Config) -> Vec<String> {
+    let Some(map_path) = &cfg.module_map else {
+        return Vec::new();
+    };
+    let edges = match module_map_call_edges(map_path) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (i, ti) in cfg.tasks.iter().enumerate() {
+        for tj in cfg.tasks.iter().skip(i + 1) {
+            for (from, to) in &edges {
+                let forward = scope_hits(&ti.scope, from) && scope_hits(&tj.scope, to);
+                let reverse = scope_hits(&ti.scope, to) && scope_hits(&tj.scope, from);
+                if forward || reverse {
+                    out.push(format!(
+                        "warning: tasks '{}' and '{}' are call-connected via module map \
+                         ({} -> {}): consider sequencing with deps",
+                        ti.id, tj.id, from, to
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]

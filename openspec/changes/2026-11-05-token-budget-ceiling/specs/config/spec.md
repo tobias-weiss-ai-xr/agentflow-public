@@ -4,12 +4,17 @@
 
 ### Requirement: Environment overrides
 
-`af` SHALL honor the environment variables `AF_REPO_DIR`, `AF_STATE_DIR`, `AF_MAX_PARALLEL`, `AF_BRANCH_PREFIX`, `AF_POLL`, `AF_GATE_ENV` with documented defaults, matching taskfleet semantics for drop-in compatibility. `AF_MAX_TOKENS` (campaign token spend ceiling, `0` = unlimited) SHALL be honored the same way, defaulting to `0`. For every such variable af SHALL read the `AF_*` name first and, only when it is unset, fall back to the legacy `TF_*` name; when a legacy `TF_*` name is consulted af SHALL print a deprecation notice to stderr (`warning: TF_X is deprecated; use AF_X instead`) at most once per legacy name per process.
+`af` SHALL honor the environment variables `AF_REPO_DIR`, `AF_STATE_DIR`, `AF_MAX_PARALLEL`, `AF_BRANCH_PREFIX`, `AF_POLL`, `AF_GATE_ENV`, and `AF_PROMPT_FILE` with documented defaults, matching taskfleet semantics for drop-in compatibility. `AF_MAX_TOKENS` (campaign token spend ceiling, `0` = unlimited) SHALL be honored the same way, defaulting to `0`. `AF_PROMPT_FILE` SHALL override the prompt-template path, defaulting to `prompts/worker.md`; the template file SHALL be re-read for every rendered prompt. For every such variable af SHALL read the `AF_*` name first and, only when it is unset, fall back to the legacy `TF_*` name; when a legacy `TF_*` name is consulted af SHALL print a deprecation notice to stderr (`warning: TF_X is deprecated; use AF_X instead`) at most once per legacy name per process.
 
 #### Scenario: overrides applied
 
 WHEN `AF_MAX_PARALLEL=2` and `AF_POLL=5` are set in the environment
 THEN the scheduler uses max 2 parallel tasks and a 5s poll interval.
+
+#### Scenario: prompt template is selectable per campaign
+
+WHEN `AF_PROMPT_FILE=/srv/wo/template.md` is set
+THEN prompts render from that file instead of `prompts/worker.md`.
 
 #### Scenario: legacy TF_* names still apply with a warning
 

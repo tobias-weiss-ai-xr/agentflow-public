@@ -71,6 +71,79 @@ fn default_output() -> String {
     "text".to_string()
 }
 
+/// Per-task context injected into the agent prompt via the `{{CONTEXT}}`
+/// placeholder. A single string renders verbatim; an array renders
+/// newline-joined. Empty variants are normalized to NO context at load time
+/// (`de_opt_task_context`), so absent/empty is indistinguishable from unset
+/// downstream — a task whose `{{#CONTEXT}}…{{/CONTEXT}}` section is dropped
+/// just renders without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskContext {
+    Text(String),
+    Lines(Vec<String>),
+}
+
+impl TaskContext {
+    /// The prompt-renderable string (newline-joined for the array form).
+    pub fn rendered(&self) -> String {
+        match self {
+            TaskContext::Text(s) => s.clone(),
+            TaskContext::Lines(ls) => ls.join("\n"),
+        }
+    }
+}
+
+/// Symmetric with the JSON shape so a re-serialized task keeps the form the
+/// operator wrote (`"context": "…"` vs `"context": ["…"]`), never the
+/// enum-variant encoding.
+impl Serialize for TaskContext {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TaskContext::Text(t) => s.serialize_str(t),
+            TaskContext::Lines(ls) => ls.serialize(s),
+        }
+    }
+}
+
+/// Deserialize `context` into `Option<TaskContext>`, normalizing the
+/// absent/null/empty-string/empty-array cases to `None` (per the task
+/// schema-loading delta). A non-string, non-array value and a non-string
+/// array entry are HARD loading errors — a human readable one naming the
+/// expected shape — so a typo is caught at config time, not mid-attempt.
+fn de_opt_task_context<'de, D>(d: D) -> Result<Option<TaskContext>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            if s.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(TaskContext::Text(s)))
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            let mut lines = Vec::new();
+            for v in items {
+                match v {
+                    serde_json::Value::String(s) => lines.push(s),
+                    _ => return Err(D::Error::custom("context array entries must be strings")),
+                }
+            }
+            if lines.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(TaskContext::Lines(lines)))
+            }
+        }
+        Some(_) => Err(D::Error::custom(
+            "task context must be a string or an array of strings",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Task {
@@ -143,6 +216,15 @@ pub struct Task {
     /// array (treat as absent). Absent = no cascade (UCB1 as today).
     #[serde(default)]
     pub cascade: Option<Vec<String>>,
+    /// Per-task context injected into the agent prompt: an optional free-form
+    /// string, or an array of strings joined with newlines — rendered via the
+    /// `{{CONTEXT}}` placeholder, with the `{{#CONTEXT}}…{{/CONTEXT}}`
+    /// conditional section dropping when unset. Absent/`null`/empty string/
+    /// empty array all normalize to no context (the operator's "mission" for
+    /// this task beyond the acceptance prose). Purely declarative: no
+    /// behaviour change when absent.
+    #[serde(default, deserialize_with = "de_opt_task_context")]
+    pub context: Option<TaskContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +375,11 @@ pub struct Config {
     /// Named repositories (multi-repo mode, optional). Missing/empty map =
     /// single-repo mode: every task targets `AF_REPO_DIR`.
     pub repos: BTreeMap<String, PathBuf>,
+    /// ADR-16: the declared module map, resolved against the tasks file's
+    /// parent directory. `None` means "feature off" — the field is absent
+    /// (silent) or declared-but-unreadable (a warning is pushed, never a
+    /// hard error).
+    pub module_map: Option<PathBuf>,
     /// Non-fatal compatibility notes (dangling deps, gate-less tasks) —
     /// taskfleet's corpus relies on these, so they warn instead of fail.
     pub warnings: Vec<String>,
@@ -302,6 +389,12 @@ pub struct Config {
 struct TasksFile {
     #[serde(default)]
     _meta: Option<serde_json::Value>,
+    /// ADR-16 (code-graph-assisted task scoping): optional path to a static
+    /// JSON module map declared by the campaign at the TOP LEVEL of
+    /// tasks.json (sibling of `_meta`/`tasks`). Consumed by `af validate`;
+    /// a stale map is a warning, never a hard error.
+    #[serde(default)]
+    module_map: Option<String>,
     #[serde(default)]
     tasks: Vec<Task>,
 }
@@ -327,6 +420,36 @@ pub fn load(tasks_path: &Path, workers_path: &Path) -> Result<Config, String> {
 
     let mut warnings = validate(&tf.tasks, &wf.workers)?;
 
+    // ADR-16: the module map is declared at the top level of tasks.json.
+    // Relative paths resolve against the tasks file's parent directory so a
+    // campaign config stays relocatable with its map alongside it. A
+    // declared-but-unreadable/invalid map degrades to None plus a warning —
+    // scope-contention checks are a convenience, never a hard error. An
+    // absent declaration is silent (feature off).
+    let module_map = match tf.module_map.as_deref() {
+        None => None,
+        Some(declared) => {
+            let path = resolve_module_map_path(tasks_path, Path::new(declared));
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
+            match parsed {
+                Ok(()) => Some(path),
+                Err(_) => {
+                    warnings.push(format!(
+                        "module_map {}: unreadable/invalid — scope-contention checks disabled",
+                        path.display()
+                    ));
+                    None
+                }
+            }
+        }
+    };
+
     let by_id: HashMap<String, Task> = tf.tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
 
     // Dangling deps are non-fatal (compat: configs reference tasks merged in
@@ -345,12 +468,27 @@ pub fn load(tasks_path: &Path, workers_path: &Path) -> Result<Config, String> {
 
     Ok(Config {
         repos: BTreeMap::new(),
+        module_map,
         tasks: tf.tasks,
         workers: wf.workers,
         defaults: wf.defaults,
         by_id,
         warnings,
     })
+}
+
+/// ADR-16: a `module_map` declared relative in tasks.json resolves against
+/// the tasks file's parent directory (a bare filename, e.g. from a CLI cwd
+/// of the config dir, resolves against `.` — no parent). Absolute
+/// declarations pass through untouched.
+fn resolve_module_map_path(tasks_path: &Path, declared: &Path) -> PathBuf {
+    if declared.is_absolute() {
+        return declared.to_path_buf();
+    }
+    match tasks_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(base) => base.join(declared),
+        None => declared.to_path_buf(),
+    }
 }
 
 /// A declared cost-basis number is usable only when finite and strictly
@@ -772,6 +910,18 @@ fn env_or_int(key: &str, default: u64) -> u64 {
     af_var(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// The prompt-template path: `AF_PROMPT_FILE` first, then the legacy
+/// `TF_PROMPT_FILE` twin (with the one-time deprecation notice), then
+/// `prompts/worker.md`. Pure over an injected lookup so the precedence and
+/// deprecation rules are testable without touching the process environment
+/// (the race-prone pattern the `env_fallback` unit tests already avoid).
+pub(crate) fn prompt_file_override(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    match env_fallback("AF_PROMPT_FILE", lookup) {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from("prompts/worker.md"),
+    }
+}
+
 impl Settings {
     pub fn from_env() -> Settings {
         let state_dir = PathBuf::from(env_or("AF_STATE_DIR", "state"));
@@ -788,7 +938,7 @@ impl Settings {
             gate_env: parse_gate_env(&env_or("AF_GATE_ENV", "")),
             tasks_file: PathBuf::from(env_or("AF_TASKS_JSON", "config/tasks.json")),
             workers_file: PathBuf::from(env_or("AF_WORKERS_JSON", "config/workers.json")),
-            prompt_file: PathBuf::from("prompts/worker.md"),
+            prompt_file: prompt_file_override(&|n| std::env::var(n).ok()),
             agent_timeout_s: env_or_int("AF_AGENT_TIMEOUT_S", 3600),
             agent_stall_s: env_or_int("AF_AGENT_STALL_S", 0),
             agent_max_turns: env_or_int("AF_AGENT_MAX_TURNS", 0) as u32,
@@ -915,6 +1065,7 @@ pub fn load_workers_str(json: &str) -> Result<Config, String> {
         defaults: wf.defaults,
         by_id: HashMap::new(),
         repos: BTreeMap::new(),
+        module_map: None,
         warnings,
     })
 }
@@ -1344,6 +1495,186 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    // spec: config/task-schema-loading#task-context-parses-as-a-string
+    fn task_context_string_parses() {
+        let d = tmpdir("cfg-ctx-str");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","accept":"true","context":"read docs/CONVENTIONS.md first"}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let cfg = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        let a = cfg.tasks.iter().find(|t| t.id == "A").unwrap();
+        assert_eq!(
+            a.context,
+            Some(TaskContext::Text("read docs/CONVENTIONS.md first".into()))
+        );
+        assert_eq!(
+            a.context.as_ref().unwrap().rendered(),
+            "read docs/CONVENTIONS.md first"
+        );
+    }
+
+    #[test]
+    // spec: config/task-schema-loading#task-context-parses-as-an-array
+    fn task_context_array_parses_and_joins() {
+        let d = tmpdir("cfg-ctx-arr");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","accept":"true","context":["invariant: zero runtime deps","gate is replay-safe: keep it that way"]}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let cfg = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        let a = cfg.tasks.iter().find(|t| t.id == "A").unwrap();
+        assert_eq!(
+            a.context,
+            Some(TaskContext::Lines(vec![
+                "invariant: zero runtime deps".into(),
+                "gate is replay-safe: keep it that way".into()
+            ]))
+        );
+        assert_eq!(
+            a.context.as_ref().unwrap().rendered(),
+            "invariant: zero runtime deps\ngate is replay-safe: keep it that way"
+        );
+    }
+
+    #[test]
+    // spec: config/task-schema-loading#empty-or-absent-context-is-a-no-op
+    fn task_context_empty_absent_and_null_is_none() {
+        let d = tmpdir("cfg-ctx-none");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","accept":"true"},
+                {"id":"B","title":"y","accept":"true","context":""},
+                {"id":"C","title":"z","accept":"true","context":[]},
+                {"id":"D","title":"w","accept":"true","context":null}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let cfg = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        for t in &cfg.tasks {
+            assert_eq!(
+                t.context, None,
+                "task {} should normalize to no context",
+                t.id
+            );
+        }
+    }
+
+    #[test]
+    fn task_context_serialize_round_trips_the_json_shape() {
+        // The manual Serialize impl must reproduce what the operator wrote
+        // (string vs array), never the enum-variant encoding. Round-trip
+        // through the LOADER's field deserializer closes the loop (the
+        // field deserializer owns parsing, not the type itself).
+        assert_eq!(
+            serde_json::to_string(&TaskContext::Text("hi".into())).unwrap(),
+            r#""hi""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskContext::Lines(vec!["a".into(), "b".into()])).unwrap(),
+            r#"["a","b"]"#
+        );
+        let json = r#"{"context":"round"}"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let ctx_json = serde_json::to_string(&v["context"]).unwrap();
+        let mut d = serde_json::Deserializer::from_str(&ctx_json);
+        let de: Option<TaskContext> = de_opt_task_context(&mut d).unwrap();
+        assert_eq!(de, Some(TaskContext::Text("round".into())));
+    }
+
+    #[test]
+    fn task_context_wrong_type_is_rejected() {
+        let d = tmpdir("cfg-ctx-bad");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","accept":"true","context":{"a":1}}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let e = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap_err();
+        assert!(
+            e.contains("task context must be a string or an array of strings"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    fn task_context_array_with_non_string_entry_is_rejected() {
+        let d = tmpdir("cfg-ctx-nonstr");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [
+                {"id":"A","title":"x","accept":"true","context":["ok", 42]}
+            ]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"p","model":"m"}]}"#,
+        );
+        let e = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap_err();
+        assert!(
+            e.contains("context array entries must be strings"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    // spec: config/environment-overrides#prompt-template-is-selectable-per-campaign
+    fn prompt_file_override_prefers_af_then_legacy_then_default() {
+        // Injected lookup — no process-global mutation, race-free (the same
+        // pattern as `env_fallback_prefers_af_then_legacy`).
+        let both = |name: &str| -> Option<String> {
+            match name {
+                "AF_PROMPT_FILE" => Some("/srv/wo/template.md".into()),
+                "TF_PROMPT_FILE" => Some("/legacy.md".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            prompt_file_override(&both),
+            PathBuf::from("/srv/wo/template.md"),
+            "AF_* wins when both are set"
+        );
+        let legacy = |name: &str| -> Option<String> {
+            match name {
+                "TF_PROMPT_FILE" => Some("/legacy.md".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            prompt_file_override(&legacy),
+            PathBuf::from("/legacy.md"),
+            "legacy TF_* answers when AF_* is absent"
+        );
+        let none = |_: &str| None;
+        assert_eq!(
+            prompt_file_override(&none),
+            PathBuf::from("prompts/worker.md"),
+            "default when unset"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1393,6 +1724,7 @@ mod repo_tests {
             defaults: WorkerDefaults::default(),
             by_id: HashMap::new(),
             repos: BTreeMap::new(),
+            module_map: None,
             warnings: vec![],
         };
         let mk = |repo: &str| Task {
@@ -1447,6 +1779,7 @@ mod repo_tests {
             defaults: WorkerDefaults::default(),
             by_id: HashMap::new(),
             repos: BTreeMap::new(),
+            module_map: None,
             warnings: vec![],
         };
         cfg.by_id = cfg

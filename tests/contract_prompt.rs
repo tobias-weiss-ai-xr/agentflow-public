@@ -272,3 +272,87 @@ fn hostile_template_is_reported_and_repaired() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The SHIPPED `prompts/worker.md` template — the file production actually
+/// renders — carries no dead placeholders and never leaks `{{`; a crafted
+/// task context lands in its `{{#CONTEXT}}` section, and the
+/// `{{PREVIOUS_ERROR}}` token holds the retry block.
+fn shipped_worker_md() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts/worker.md")
+}
+
+// spec: lifecycle/prompt-placeholder-guarantee#no-placeholder-leaks
+// spec: lifecycle/prompt-rendering#task-context-is-injected
+// spec: lifecycle/prompt-rendering#custom-template-is-selected-per-campaign
+#[test]
+fn shipped_worker_md_renders_clean_with_context_and_retry_block() {
+    use agentflow::config::TaskContext;
+    let worker = contract_worker();
+    let dir = tmpdir("shipped");
+    let template = write_template(
+        &dir,
+        "copy.md",
+        &std::fs::read_to_string(shipped_worker_md()).expect("prompts/worker.md present"),
+    );
+
+    // (a) No context, first attempt: full contract, zero placeholder leaks,
+    // no dead {{EPISODES}}/{{MISSION}}/{{PREVIOUS_ERROR}} tokens.
+    let out = render_prompt(
+        &settings_with_prompt_file(template.clone()),
+        &contract_task(),
+        &worker,
+        None,
+    );
+    assert_prompt_contract("shipped worker.md (first attempt)", &out, &SCOPE_PATHS);
+    assert!(
+        !out.contains("Previous attempts"),
+        "attempt 1 must have no history block"
+    );
+    for dead in ["{{EPISODES}}", "{{MISSION}}", "{{PREVIOUS_ERROR}}"] {
+        assert!(!out.contains(dead), "dead placeholder {dead} must not leak");
+    }
+    assert!(
+        !out.contains("Task context"),
+        "no {{#CONTEXT}} section without a declared context"
+    );
+
+    // (b) With a declared context: the section appears with the payload.
+    let ctx_task = agentflow::config::Task {
+        context: Some(TaskContext::Text("read docs/CONVENTIONS.md first".into())),
+        ..contract_task()
+    };
+    let out = render_prompt(
+        &settings_with_prompt_file(template.clone()),
+        &ctx_task,
+        &worker,
+        None,
+    );
+    assert!(
+        out.contains("## Task context") && out.contains("read docs/CONVENTIONS.md first"),
+        "crafted context must land in the shipped template:\n{out}"
+    );
+    assert!(
+        !out.contains("{{#CONTEXT}}"),
+        "marker must not leak when active"
+    );
+
+    // (c) Retry: the block substitutes INTO the {{PREVIOUS_ERROR}} token.
+    let block = "\n## Previous attempts\n- attempt 1: gate boom\n";
+    let out = render_prompt(
+        &settings_with_prompt_file(template),
+        &contract_task(),
+        &worker,
+        Some(block),
+    );
+    assert!(out.contains("attempt 1: gate boom"), "retry block present");
+    assert!(
+        !out.contains("{{PREVIOUS_ERROR}}"),
+        "token must not leak after substitution"
+    );
+    assert!(
+        out.contains("## If you are a merge-conflict retry"),
+        "template body intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

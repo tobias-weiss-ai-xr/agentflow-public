@@ -1225,16 +1225,36 @@ fn retry_after_gate_failure_runs_fresh_attempts_until_it_passes() {
     );
 
     // The gate-only retry's SECOND failure archives the very work the retry
-    // was built to preserve: the receipt names the archived branch and the
-    // ref survives the fresh attempt 3. `cleanup()` used to delete it.
+    // was built to preserve: the receipt carries the gate's failure tail
+    // (the marker for an empty gate output — the gate produces no output,
+    // just a counter exit), and the archived ref survives the fresh
+    // attempt 3. `cleanup()` used to delete it. The `; work kept on branch`
+    // suffix is retry metadata, not gate output, so it is stripped from the
+    // receipt error (the branch name is in the log and the archived ref).
     let second = receipts.iter().find(|r| r.attempt == 2).unwrap();
     assert!(
         second
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("work kept on branch tf/A-rejected-"),
-        "the reused-gate failure names the archived branch: {second:?}"
+            .starts_with("acceptance gate failed (exit 1):"),
+        "gate-failure receipt carries the gate prefix: {second:?}"
+    );
+    assert!(
+        second
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("(gate produced no output"),
+        "empty gate output yields the marker, not the kept suffix: {second:?}"
+    );
+    assert!(
+        !second
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("work kept on branch"),
+        "kept suffix is stripped from the receipt error (it is in the log): {second:?}"
     );
     let archived = archived_refs(&f.repo);
     assert_eq!(

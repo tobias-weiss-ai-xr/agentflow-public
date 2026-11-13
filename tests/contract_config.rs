@@ -991,7 +991,7 @@ fn settings_env_defaults_and_overrides_contract() {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    const KEYS_AF: [&str; 11] = [
+    const KEYS_AF: [&str; 12] = [
         "AF_REPO_DIR",
         "AF_STATE_DIR",
         "AF_WORKTREE_ROOT",
@@ -1003,8 +1003,9 @@ fn settings_env_defaults_and_overrides_contract() {
         "AF_WORKERS_JSON",
         "AF_AGENT_TIMEOUT_S",
         "AF_SANDBOX_CMD",
+        "AF_PROMPT_FILE",
     ];
-    const KEYS_TF: [&str; 11] = [
+    const KEYS_TF: [&str; 12] = [
         "TF_REPO_DIR",
         "TF_STATE_DIR",
         "TF_WORKTREE_ROOT",
@@ -1016,6 +1017,7 @@ fn settings_env_defaults_and_overrides_contract() {
         "TF_WORKERS_JSON",
         "TF_AGENT_TIMEOUT_S",
         "TF_SANDBOX_CMD",
+        "TF_PROMPT_FILE",
     ];
     // Unset BOTH prefixes so a phase is deterministic regardless of the host
     // environment (the legacy names would otherwise answer as fallbacks).
@@ -1049,6 +1051,34 @@ fn settings_env_defaults_and_overrides_contract() {
     } // Guards drop here: the ambient env is restored before phase 2.
 
     // Phase 2: explicit AF_* values win.
+    // The prompt template path (AF_PROMPT_FILE vs TF_PROMPT_FILE) is part
+    // of the same environment-overrides contract, asserted here with the
+    // same clear/set/restore discipline.
+    let prompt_tpl = fresh_dir("settings-prompt").join("wo.md");
+    {
+        let _set = clear_all();
+        let s = Settings::from_env();
+        assert_eq!(s.prompt_file, PathBuf::from("prompts/worker.md"));
+        drop(_set);
+    }
+    {
+        let mut set = clear_all();
+        set.extend([EnvVar::set("AF_PROMPT_FILE", prompt_tpl.to_str().unwrap())]);
+        let _set = set;
+        let s = Settings::from_env();
+        assert_eq!(
+            s.prompt_file, prompt_tpl,
+            "AF_PROMPT_FILE overrides the default"
+        );
+    }
+    {
+        let mut set = clear_all();
+        set.extend([EnvVar::set("TF_PROMPT_FILE", prompt_tpl.to_str().unwrap())]);
+        let _set = set;
+        let s = Settings::from_env();
+        assert_eq!(s.prompt_file, prompt_tpl, "legacy TF_PROMPT_FILE applies");
+    }
+
     let repo = fresh_dir("settings-repo");
     let state = fresh_dir("settings-state");
     {
