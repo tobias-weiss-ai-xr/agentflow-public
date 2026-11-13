@@ -648,7 +648,7 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
             }
         }
     }
-    // Gate/scope mismatch (World-Office lesson, 2026-10-14): a task scoped to
+    // Gate/scope mismatch (gate-scope lesson, 2026-10-14): a task scoped to
     // a few crates whose accept runs a whole-workspace gate (the one
     // unambiguous cargo marker is `--workspace`) fails forever on
     // out-of-scope diagnostics, no matter how good the agent is. Non-fatal:

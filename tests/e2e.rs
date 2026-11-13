@@ -320,7 +320,7 @@ fn agent_failure_fails_task() {
 /// e.g. vllm "Duplicate tool call id", a network blip after completion). The
 /// exit code is transport noise, not a work verdict: the committed change
 /// must still be judged by the gate and merged. This is the regression the
-/// World-Office campaigns kept hitting (each lost attempt cost a manual
+/// a long-running campaign kept hitting (each lost attempt cost a manual
 /// rejected-branch rescue); before the fix it reported "agent exited
 /// NonZero (code 1)" and archived the work instead of merging it.
 // spec: lifecycle/execute-pipeline#agent-failure

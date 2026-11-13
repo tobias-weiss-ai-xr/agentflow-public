@@ -18,6 +18,9 @@ result*
 /config/*-workers.json
 /config/tasks.json
 /config/workers-*.json
+/config/*/
+/state-*
+/.cgcignore
 /config/hessenbox-fix/
 /config/opensme-backlog/
 /config/opensme-round1/
@@ -29,3 +32,4 @@ result*
 /config/self-improve/
 /state-self-improve/
 __pycache__/
+/gen-*.py

@@ -310,7 +310,7 @@ fn failure_context(receipts: &[Receipt], task_id: &str, attempt: u32) -> Option<
 /// speculative. ponytail: env knob only if long-horizon tasks ever need >128.
 const TURN_CAP_CEILING: u32 = 128;
 
-/// Turn-cap escalation (World-Office lesson, 2026-10-14): a turn-cap failure
+/// Turn-cap escalation (turn-cap lesson, 2026-10-14): a turn-cap failure
 /// is a BUDGET signal, not a quality signal. If any earlier failed attempt of
 /// this task died at `harness: turn cap N reached`, the retry runs with
 /// `2 × max(N)`, clamped to [`TURN_CAP_CEILING`]; otherwise the configured

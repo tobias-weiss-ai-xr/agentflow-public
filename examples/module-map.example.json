@@ -1,0 +1,19 @@
+{
+  "files": [
+    "src/run.rs",
+    "src/state.rs",
+    "src/router.rs"
+  ],
+  "functions": [
+    { "name": "run_campaign", "path": "src/run.rs", "line": 42 },
+    { "name": "load_state", "path": "src/state.rs", "line": 88 },
+    { "name": "save_state", "path": "src/state.rs", "line": 130 },
+    { "name": "pick_worker", "path": "src/router.rs", "line": 25 }
+  ],
+  "calls": [
+    { "from": "src/run.rs", "to": "src/state.rs" },
+    { "from": "src/run.rs", "to": "src/router.rs" },
+    { "from": "src/router.rs", "to": "src/state.rs" },
+    { "from": "src/state.rs", "to": "src/run.rs" }
+  ]
+}

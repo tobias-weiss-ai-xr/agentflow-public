@@ -27,7 +27,7 @@ Three concrete, code-pinned defects:
 
 2. **Broken gates burn the whole retry budget.** `T-001`, `T-006`
    (`Syntax error: "(" unexpected` — the gate itself is unparsable),
-   `T2-TILES` (exit 127), and the World-Office orbit/cube-orient tasks
+   `T2-TILES` (exit 127), and the orbit/cube-orient tasks
    ("✗ GATE FAILED … fehlt") fail BYTE-IDENTICALLY on every attempt. af
    re-pays a full agent each fresh attempt — `T-002` spent 579 s + 404 s +
    920 s across three agents on the same `PARSE-FAIL` before giving up.
@@ -37,7 +37,7 @@ Three concrete, code-pinned defects:
 3. **Infra failure is invisible per worker.** 400/404/429/timeout receipts
    are correctly non-verdicts, so a worker whose *model name drifted* shows
    full trust in `af cost` with no hint of the 17 wasted attempts behind it.
-   The WO loop on legion runs `probe-*.sh` for exactly this reason; af
+   Operators run probe scripts for exactly this reason; af
    should surface it in the report it already prints.
 
 ## What Changes
@@ -92,4 +92,4 @@ the report.
 - **No gate-runner changes.** Gates stay user-authored shell; `gate.rs`
   only supplies output the *receipt* uses differently.
 - **No probe/network feature** (ADR-1): pre-flight model checks stay the
-  operator-side `scripts/wo-loop/probe-*.sh`.
+  operator-side probe scripts.

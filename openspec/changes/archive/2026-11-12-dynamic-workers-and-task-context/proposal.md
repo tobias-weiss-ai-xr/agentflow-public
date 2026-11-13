@@ -2,8 +2,8 @@
 
 ## Why
 
-Two operator asks from campaign usage (World-Office parity loop on legion,
-dogfood campaigns, openSME series):
+Two operator asks from campaign usage (long-running parity loops,
+dogfood campaigns, multi-repo series):
 
 1. **Change the worker pool on the fly.** `af run` already hot-reloads
    `tasks.json`/`workers.json` by mtime (feedback §6.2), and a disabled /
@@ -65,7 +65,7 @@ p90 50, and the "default 12-16 turns" guidance in README is too tight
   to use `{{CONTEXT}}` / `{{PREVIOUS_ERROR}}`.
 - New `AF_PROMPT_FILE` env var (with legacy `TF_PROMPT_FILE` fallback per the
   `env_fallback` rule): overrides the prompt-template path, so a campaign
-  (e.g. the World-Office loop on legion) can ship its own template next to
+  (e.g. a long-running parity loop) can ship its own template next to
   its `tasks.json`/`workers.json` without touching the repo default. The
   template file is re-read per render, so editing it mid-run already takes
   effect on the next attempt.

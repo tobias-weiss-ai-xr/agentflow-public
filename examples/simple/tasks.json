@@ -1,0 +1,24 @@
+{
+  "tasks": [
+    {
+      "id": "hello-module",
+      "title": "Add a hello module",
+      "deps": [],
+      "scope": ["src/hello.py"],
+      "accept": "test -f src/hello.py && grep -q 'def hello' src/hello.py",
+      "acceptance_prose": "src/hello.py exists in the target repo and defines a callable hello() function.",
+      "manual": false,
+      "max_turns": 16
+    },
+    {
+      "id": "hello-docs",
+      "title": "Document the hello module",
+      "deps": ["hello-module"],
+      "scope": ["docs/hello.md"],
+      "accept": "test -f docs/hello.md && grep -qi hello docs/hello.md",
+      "acceptance_prose": "docs/hello.md exists and explains what the hello module does and how to call it.",
+      "manual": false,
+      "max_turns": 16
+    }
+  ]
+}

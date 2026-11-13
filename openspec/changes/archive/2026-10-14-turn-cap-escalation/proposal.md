@@ -2,7 +2,7 @@
 
 ## Why
 
-The World-Office campaign (2026-10-14) lost five consecutive attempts to
+A long-running campaign (2026-10-14) lost five consecutive attempts to
 `harness: turn cap 12 reached` even though the r19 calibration ("12 is enough")
 was followed — the calibration holds only for simple write+commit+gate tasks.
 Two systemic gaps surfaced:

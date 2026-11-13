@@ -1,0 +1,87 @@
+name: release
+
+# Cutting a release is now automatic: push a v* tag (cut with
+# scripts/bump-version.sh) and this workflow tests, builds both
+# architectures (x64 native, arm64 via cross), packages tarballs +
+# SHA256SUMS, and publishes the GitHub release with notes extracted
+# from the matching CHANGELOG.md section.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual trigger on a tag ref (gh workflow run release.yml --ref vX.Y.Z)
+    inputs:
+      tag:
+        description: "Tag to release (defaults to the ref this run was started on)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: [self-hosted, af-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  build:
+    runs-on: [self-hosted, af-ci]
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags + full history so --version composes from git
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build x64 (native)
+        run: cargo build --release
+      - name: Smoke x64
+        run: target/release/af --version
+      - name: Install zig 0.13.0
+        run: |
+          curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar xJ -C "$HOME"
+          echo "$HOME/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+      - name: Build arm64 (zigbuild, glibc 2.31 baseline)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - run: cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist-out
+          cp target/release/af "dist-out/af-linux-x64"
+          cp target/aarch64-unknown-linux-gnu/release/af "dist-out/af-linux-arm64"
+          test -x dist-out/af-linux-x64 && file dist-out/af-linux-arm64 | grep -q aarch64
+          cd dist-out
+          tar czf "af-linux-x64-$TAG.tar.gz" af-linux-x64
+          tar czf "af-linux-arm64-$TAG.tar.gz" af-linux-arm64
+          sha256sum "af-linux-x64-$TAG.tar.gz" "af-linux-arm64-$TAG.tar.gz" > SHA256SUMS
+      - name: Release notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VER="${TAG#v}"
+          awk -v ver="$VER" '
+            index($0, "## [" ver "]") == 1 { found=1; next }
+            /^## \[/ && found { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e :a -e '/./,$!d' -e '/^$/{$d;N;ba' -e '}' > release-notes.md
+          # Fallback when the section is missing
+          if [ ! -s release-notes.md ]; then
+            echo "Release $TAG — see CHANGELOG.md." > release-notes.md
+          fi
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: |
+            dist-out/af-linux-x64-*.tar.gz
+            dist-out/af-linux-arm64-*.tar.gz
+            dist-out/SHA256SUMS
