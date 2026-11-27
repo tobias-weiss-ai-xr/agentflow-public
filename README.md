@@ -217,11 +217,11 @@ nix build .#image -o result-image         # docker image         → result-imag
 docker load < result-image
 docker run --rm -v "$AF_REPO_DIR":/repo -v "$PWD/config":/config \
     -e AF_REPO_DIR=/repo -e AF_STATE_DIR=/state \
-    agentflow:0.1.1 run --dry-run --tasks /config/tasks.json --workers /config/workers.json
+    agentflow:0.2.0 run --dry-run --tasks /config/tasks.json --workers /config/workers.json
 ```
 
 With the entrypoint set, everything after the image name is af arguments
-(`docker run agentflow:0.1.1 --version`).
+(`docker run agentflow:0.2.0 --version`).
 
 ## Versioning & releases
 
