@@ -12,7 +12,7 @@
 | Config | JSON via `serde`; `tasks.json` / `workers.json` / optional `repos.json` schema-compatible with taskfleet's shipped examples |
 | State | JSON files under `state/`, atomic writes (temp + fsync + rename), single writer process, lock file *(ADR-3)* |
 | Receipts | JSON files under `state/receipts/`, one per attempt, atomic write (unique temp filename + fsync + rename) |
-| Test suite | 466 tests (unit + integration + E2E + contract); line-coverage ratchet at 94% (`.coverage-min`, `scripts/coverage-gate.sh`, measured 95.50%) |
+| Test suite | 544 tests (unit + integration + E2E + contract); line-coverage ratchet at 94% (`.coverage-min`, `scripts/coverage-gate.sh`, measured 95.69%) |
 | Dependencies | `serde`, `serde_json` only — zero runtime deps beyond std |
 
 ## Organizational / Process

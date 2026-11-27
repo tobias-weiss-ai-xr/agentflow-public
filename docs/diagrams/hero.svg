@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1680 660" role="img" aria-labelledby="title desc">
+  <title id="title">agentflow — parallel LLM task execution on isolated git worktrees</title>
+  <desc id="desc">Declare tasks and workers, isolate each task in a git worktree, dispatch to an agent CLI by UCB1 trust routing, verify against an exact acceptance gate, merge passing work or archive failing work, and learn from every receipt.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1626"/>
+      <stop offset="1" stop-color="#0a1120"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="pillarTop" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3e5270"/>
+    </marker>
+    <marker id="arrowLoop" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#35b6d6"/>
+    </marker>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- background card -->
+  <rect x="0" y="0" width="1680" height="660" rx="26" fill="url(#bg)" stroke="#1d2a3c" stroke-width="2"/>
+
+  <!-- header -->
+  <!-- logo tile -->
+  <rect x="56" y="34" width="76" height="76" rx="22" fill="url(#accent)"/>
+  <rect x="82" y="76" width="12" height="26" rx="6" fill="#0b1220" opacity="0.85"/>
+  <rect x="98" y="66" width="12" height="36" rx="6" fill="#0b1220" opacity="0.92"/>
+  <rect x="114" y="54" width="12" height="48" rx="6" fill="#ffffff"/>
+  <text x="152" y="66" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="38" font-weight="700" fill="#eef4fb">agentflow</text>
+  <text x="152" y="97" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#8ba0b8">Parallel LLM task execution on isolated git worktrees</text>
+
+  <!-- header chips -->
+  <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14.5" fill="#c3d2e4">
+    <rect x="1464" y="48" width="160" height="34" rx="17" fill="#131c2e" stroke="#243349"/>
+    <text x="1544" y="70" text-anchor="middle">exact accept gates</text>
+    <rect x="1317" y="48" width="135" height="34" rx="17" fill="#131c2e" stroke="#243349"/>
+    <text x="1384.5" y="70" text-anchor="middle">workers.json</text>
+    <rect x="1185" y="48" width="120" height="34" rx="17" fill="#131c2e" stroke="#243349"/>
+    <text x="1245" y="70" text-anchor="middle">tasks.json</text>
+  </g>
+
+  <!-- pillars -->
+  <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <!-- Pillar 1: Declare -->
+    <g>
+      <rect x="102" y="144" width="260" height="240" rx="18" fill="#0f1729" stroke="#1f2c40" stroke-width="1.5"/>
+      <rect x="102" y="144" width="260" height="5" rx="2.5" fill="url(#pillarTop)"/>
+      <circle cx="232" cy="200" r="28" fill="url(#accent)"/>
+      <g stroke="#ffffff" stroke-width="2" fill="none" stroke-linejoin="round" stroke-linecap="round" transform="translate(232,200)">
+        <path d="M -10 -11 L -2 -11 L 5 -4 L 5 11 L -10 11 Z"/>
+        <path d="M -2 -11 L -2 -4 L 5 -4"/>
+        <path d="M -7 0 h 9 M -7 4 h 9 M -7 8 h 6"/>
+      </g>
+      <text x="360" y="243" text-anchor="middle" font-size="12.5" fill="#3d5070">01</text>
+      <text x="232" y="266" text-anchor="middle" font-size="22" font-weight="700" fill="#e7eef8">Declare</text>
+      <text x="232" y="300" text-anchor="middle" font-size="15" fill="#90a4bd">tasks.json · N declarative tasks</text>
+      <text x="232" y="326" text-anchor="middle" font-size="15" fill="#90a4bd">workers.json · M providers</text>
+      <text x="232" y="352" text-anchor="middle" font-size="15" fill="#90a4bd">deps · scope · accept gates</text>
+    </g>
+
+    <!-- Pillar 2: Isolate -->
+    <g>
+      <rect x="406" y="144" width="260" height="240" rx="18" fill="#0f1729" stroke="#1f2c40" stroke-width="1.5"/>
+      <rect x="406" y="144" width="260" height="5" rx="2.5" fill="url(#pillarTop)"/>
+      <circle cx="536" cy="200" r="28" fill="url(#accent)"/>
+      <g stroke="#ffffff" stroke-width="2" fill="none" stroke-linecap="round" transform="translate(536,200)">
+        <path d="M -2 -8 C -2 -4 3 -3 3 2 C 3 5 0 6 -2 8"/>
+        <circle cx="-2" cy="-9" r="3.4"/>
+        <circle cx="-2" cy="9" r="3.4"/>
+        <circle cx="7" cy="1" r="3.4"/>
+      </g>
+      <text x="664" y="243" text-anchor="middle" font-size="12.5" fill="#3d5070">02</text>
+      <text x="536" y="266" text-anchor="middle" font-size="22" font-weight="700" fill="#e7eef8">Isolate</text>
+      <text x="536" y="300" text-anchor="middle" font-size="15" fill="#90a4bd">fresh git worktree per task</text>
+      <text x="536" y="326" text-anchor="middle" font-size="15" fill="#90a4bd">dedicated branch off base</text>
+      <text x="536" y="352" text-anchor="middle" font-size="15" fill="#90a4bd">no cross-task interference</text>
+    </g>
+
+    <!-- Pillar 3: Dispatch -->
+    <g>
+      <rect x="710" y="144" width="260" height="240" rx="18" fill="#101a2d" stroke="#2b4463" stroke-width="1.8"/>
+      <rect x="710" y="144" width="260" height="5" rx="2.5" fill="url(#pillarTop)"/>
+      <circle cx="840" cy="200" r="28" fill="url(#accent)" filter="url(#glow)"/>
+      <g stroke="#ffffff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(840,200)">
+        <rect x="-12" y="-9" width="24" height="18" rx="3"/>
+        <path d="M -8 -3 L -4 0 L -8 3"/>
+        <path d="M -2 3 H 5"/>
+      </g>
+      <text x="968" y="243" text-anchor="middle" font-size="12.5" fill="#3d5070">03</text>
+      <text x="840" y="266" text-anchor="middle" font-size="22" font-weight="700" fill="#eef5fd">Dispatch</text>
+      <text x="840" y="300" text-anchor="middle" font-size="15" fill="#9db0c6">agent CLI · UCB1 trust routing</text>
+      <text x="840" y="326" text-anchor="middle" font-size="15" fill="#9db0c6">pi · opencode · builtin harness</text>
+      <text x="840" y="352" text-anchor="middle" font-size="15" fill="#9db0c6">retries carry failure memory</text>
+    </g>
+
+    <!-- Pillar 4: Verify -->
+    <g>
+      <rect x="1014" y="144" width="260" height="240" rx="18" fill="#0f1729" stroke="#1f2c40" stroke-width="1.5"/>
+      <rect x="1014" y="144" width="260" height="5" rx="2.5" fill="url(#pillarTop)"/>
+      <circle cx="1144" cy="200" r="28" fill="url(#accent)"/>
+      <g stroke="#ffffff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(1144,200)">
+        <path d="M 0 -10 C 3 -8 7 -8 9 -8 C 9 -2 7.5 4 0 10 C -7.5 4 -9 -2 -9 -8 C -7 -8 -3 -8 0 -10 Z"/>
+        <path d="M -4 0 L -1.2 3 L 4.5 -4"/>
+      </g>
+      <text x="1272" y="243" text-anchor="middle" font-size="12.5" fill="#3d5070">04</text>
+      <text x="1144" y="266" text-anchor="middle" font-size="22" font-weight="700" fill="#e7eef8">Verify</text>
+      <text x="1144" y="300" text-anchor="middle" font-size="15" fill="#90a4bd">exact acceptance gate</text>
+      <text x="1144" y="326" text-anchor="middle" font-size="15" fill="#90a4bd">must exit 0 in the worktree</text>
+      <text x="1144" y="352" text-anchor="middle" font-size="15" fill="#90a4bd">gate replayed on retry</text>
+    </g>
+
+    <!-- Pillar 5: Merge & learn -->
+    <g>
+      <rect x="1318" y="144" width="260" height="240" rx="18" fill="#0f1729" stroke="#1f2c40" stroke-width="1.5"/>
+      <rect x="1318" y="144" width="260" height="5" rx="2.5" fill="url(#pillarTop)"/>
+      <circle cx="1448" cy="200" r="28" fill="url(#accent)"/>
+      <g stroke="#ffffff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(1448,200)">
+        <path d="M -9 -8 L 0 0"/>
+        <path d="M 9 -8 L 0 0"/>
+        <path d="M 0 0 L 0 7"/>
+        <circle cx="-9" cy="-8" r="3"/>
+        <circle cx="9" cy="-8" r="3"/>
+        <path d="M -4 4 L 0 9 L 4 4"/>
+      </g>
+      <text x="1576" y="243" text-anchor="middle" font-size="12.5" fill="#3d5070">05</text>
+      <text x="1448" y="266" text-anchor="middle" font-size="22" font-weight="700" fill="#e7eef8">Merge &amp; learn</text>
+      <text x="1448" y="300" text-anchor="middle" font-size="15" fill="#34d399">&#10003; merged to base branch</text>
+      <text x="1448" y="326" text-anchor="middle" font-size="15" fill="#f87171">&#10007; archived branch-rejected-ts</text>
+      <text x="1448" y="352" text-anchor="middle" font-size="15" fill="#90a4bd">every attempt writes a receipt</text>
+    </g>
+  </g>
+
+  <!-- stage arrows -->
+  <g stroke="#3e5270" stroke-width="2.5" marker-end="url(#arrow)">
+    <line x1="368" y1="200" x2="400" y2="200"/>
+    <line x1="672" y1="200" x2="704" y2="200"/>
+    <line x1="976" y1="200" x2="1008" y2="200"/>
+    <line x1="1280" y1="200" x2="1312" y2="200"/>
+  </g>
+
+  <!-- feedback loop -->
+  <path d="M 1438 392 C 1510 520 1240 548 1080 542 C 960 538 900 514 852 448 C 847 440 843 420 841 402"
+        fill="none" stroke="#35b6d6" stroke-width="2.5" stroke-dasharray="7 7" marker-end="url(#arrowLoop)"/>
+  <text x="1132" y="520" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" fill="#85a7c2">receipts feed the cost &amp; trust ledger — the next dispatch learns from them</text>
+  <rect x="1030" y="560" width="204" height="26" rx="13" fill="#0e2231" stroke="#1d4b60"/>
+  <text x="1132" y="578" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#35b6d6">af cost · af status · UCB1 router</text>
+
+  <!-- footer -->
+  <line x1="60" y1="596" x2="1620" y2="596" stroke="#1e2a3a" stroke-width="1.5"/>
+  <text x="840" y="626" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" fill="#7a93ae">thin Rust orchestrator — drives git + an OpenAI-compatible agent CLI as subprocesses; never talks to LLM providers directly</text>
+  <text x="66" y="626" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#4a5f7a">af</text>
+  <text x="1614" y="626" text-anchor="end" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#4a5f7a">rust · git · receipts</text>
+</svg>

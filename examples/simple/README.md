@@ -4,6 +4,10 @@ The smallest complete `af` campaign: **two tasks** chained by a dependency and
 **one worker** using af's built-in agent harness (`"cli": "builtin"`), so no
 external agent CLI needs to be installed.
 
+> Full field references and concepts live in the main
+> [README](../../README.md); the diagram below is the tiny DAG this example
+> builds.
+
 ```
 hello-module  ──deps──▶  hello-docs
 ```

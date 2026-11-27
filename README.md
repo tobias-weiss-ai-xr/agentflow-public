@@ -2,6 +2,10 @@
 
 **Parallel LLM task execution on isolated git worktrees.**
 
+<p align="center">
+  <img src="docs/diagrams/hero.svg" alt="agentflow — declare → isolate → dispatch → verify → merge &amp; learn: tasks.json and workers.json declare N tasks and M providers; each task runs in a fresh git worktree, dispatched to an agent CLI by UCB1 trust routing, verified against an exact acceptance gate, then merged to base or archived as branch-rejected-ts; every attempt writes a receipt that feeds the cost and trust ledger for the next dispatch" width="100%">
+</p>
+
 agentflow is a small Rust orchestrator that dispatches declarative tasks to
 multiple LLM providers in parallel (via an OpenAI-compatible **agent CLI**),
 each running in an isolated git worktree. Tasks are verified against exact
@@ -63,6 +67,7 @@ Tasks, workers, and repos are plain JSON — full references in the
   - [Docker / Nix](#docker--nix)
 - [Versioning & releases](#versioning--releases)
 - [CLI](#cli)
+- [Campaign monitoring](#campaign-monitoring)
 - [Task schema](#task-schema-configtasksjson)
 - [Worker schema](#worker-schema-configworkersjson)
 - [Sandboxing](#sandboxing)
@@ -88,7 +93,7 @@ Tasks, workers, and repos are plain JSON — full references in the
 - **Self-healing** — atomic JSON state; crash-safe resume; orphan worktree cleanup at startup, plus `af clean [--dry-run]` to sweep leftovers from crashed runs — including the archived `<branch>-rejected-*` refs, whose branches are kept while their task is still running
 - **Validated config** — `af validate` pre-flights tasks/workers (dependency cycles, duplicate ids, no enabled workers) without dispatching anything
 - **Observable** — status board (`af status [--json]`), live `attach`, per-task logs, wall-clock cost receipts
-- **Sound by construction** — spec → contract → test pyramid (466 tests, incl. E2E against a stub agent + scratch git repos; no network in CI)
+- **Sound by construction** — spec → contract → test pyramid (544 tests, incl. E2E against a stub agent + scratch git repos; no network in CI)
 
 ## Quick start
 
@@ -261,7 +266,7 @@ automatically by `.github/workflows/release.yml` when a `v*` tag is pushed
 x86_64 build:
 
 ```sh
-curl -sfL <release>/af-linux-x64-v0.1.0.tar.gz | tar xz
+curl -sfL https://github.com/tobias-weiss-ai-xr/agentflow-public/releases/download/v0.2.0/af-linux-x64-v0.2.0.tar.gz | tar xz
 sudo install -m0755 af /usr/local/bin/af
 af --version
 ```
@@ -806,7 +811,7 @@ campaigns.
 ## Testing
 
 ```sh
-cargo test        # 466 tests: unit (scheduler DAG, contention, deadlock, state,
+cargo test        # 544 tests: unit (scheduler DAG, contention, deadlock, state,
                   # receipts, config validation, sandbox policy, multi-repo,
                   # UCB1 router, retry context, subprocess contracts) + E2E
                   # (fake agent + scratch git repos — no network)
@@ -819,7 +824,7 @@ See `docs/arc42/` for the architecture documentation (12 chapters), and
 
 CI enforces a **line-coverage floor** so coverage cannot silently rot. The
 floor lives in a single place — `.coverage-min` (currently `94%`, below the
-measured 95.50% baseline) — and is checked by `scripts/coverage-gate.sh`, which runs
+measured 95.69% baseline) — and is checked by `scripts/coverage-gate.sh`, which runs
 `cargo llvm-cov --workspace --fail-under-lines "$MIN"`. A drop below the floor
 fails the build.
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- README: hero concept diagram (`docs/diagrams/hero.svg`) now heads the page;
+  test counts refreshed to the measured 544 (unit 276 / integration 75 /
+  contract 73 / E2E 116 / spec traceability 4), measured coverage 95.69%,
+  prebuilt-binary snippet points at the v0.2.0 release assets, and
+  `examples/simple` links back to the main README.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added
