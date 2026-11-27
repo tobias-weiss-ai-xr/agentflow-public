@@ -187,6 +187,7 @@ fn archived_holds(repo: &Path, branch: &str, file: &str, content: &str) {
 // spec: state/cost-receipts#receipt-appended-per-attempt
 // spec: worktree/worktree-lifecycle
 // spec: worktree/worktree-lifecycle#create-and-remove
+// spec: lifecycle/dispatch-waits-for-a-clean-merge-target#a-clean-checkout-dispatches-immediately
 #[test]
 fn happy_path_dependency_and_merge() {
     let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
@@ -383,6 +384,151 @@ fn gate_failure_fails_task() {
     assert_eq!(st["A"].state, TaskState::Failed);
     assert!(st["A"].last_error.as_deref().unwrap_or("").contains("gate"));
     assert!(!f.repo.join("DONE.txt").exists());
+}
+
+/// A CLI worker dies on a transport abort in 5 seconds, commits nothing.
+/// Before: the receipt said `agent exited NonZero (code 1)` and
+/// `failure_class: "agent"` — the gateway outage lowered the worker's
+/// trust and the retry prompt told the next model nothing. This was 160 of
+/// 167 "agent" failures in the port-1000 campaign.
+// spec: state/failure-class-on-receipts#a-cli-transport-abort-is-infra
+#[test]
+fn cli_transport_abort_is_classified_infra_with_the_agents_last_line() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("FAKE_AGENT_EXIT", "1");
+    std::env::set_var("FAKE_AGENT_EXIT_SILENT", "1");
+    std::env::set_var("FAKE_AGENT_OUT", "Request was aborted");
+    let f = fixture(
+        &format!(
+            r#"{{ "tasks": [ {{"id":"A","title":"abort","scope":["DONE.txt"],"accept":"{g}"}} ] }}"#,
+            g = gate_cmd("DONE.txt")
+        ),
+        &worker_json(1),
+    );
+    std::env::set_var(
+        "AF_AGENT_ENV_PASSTHROUGH",
+        "FAKE_AGENT_EXIT,FAKE_AGENT_EXIT_SILENT,FAKE_AGENT_OUT,FAKE_AGENT_TOUCH",
+    );
+    let _ = run::run_loop(&f.cfg, &f.st, &RunOptions::default());
+    let receipts = Store::new(f.st.state_dir.clone()).load_receipts();
+    let r = receipts
+        .iter()
+        .find(|r| r.outcome == "failed")
+        .expect("a failed receipt");
+    assert_eq!(
+        r.error.as_deref(),
+        Some("agent exited NonZero (code 1); last output: Request was aborted"),
+        "the receipt carries the agent's own diagnosis"
+    );
+    assert_eq!(
+        r.failure_class.as_deref(),
+        Some("infra"),
+        "a transport abort is not a verdict on the worker"
+    );
+}
+
+/// Non-zero exit, no commits, no output at all: the receipt names the
+/// silent death instead of a bare exit code.
+// spec: state/failure-class-on-receipts#a-silent-cli-death-is-named
+#[test]
+fn cli_silent_death_is_named_on_the_receipt() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("FAKE_AGENT_EXIT", "1");
+    std::env::set_var("FAKE_AGENT_EXIT_SILENT", "1");
+    std::env::set_var("FAKE_AGENT_OUT", "");
+    let f = fixture(
+        &format!(
+            r#"{{ "tasks": [ {{"id":"A","title":"silent","scope":["DONE.txt"],"accept":"{g}"}} ] }}"#,
+            g = gate_cmd("DONE.txt")
+        ),
+        &worker_json(1),
+    );
+    std::env::set_var(
+        "AF_AGENT_ENV_PASSTHROUGH",
+        "FAKE_AGENT_EXIT,FAKE_AGENT_EXIT_SILENT,FAKE_AGENT_OUT,FAKE_AGENT_TOUCH",
+    );
+    let _ = run::run_loop(&f.cfg, &f.st, &RunOptions::default());
+    let receipts = Store::new(f.st.state_dir.clone()).load_receipts();
+    let r = receipts
+        .iter()
+        .find(|r| r.outcome == "failed")
+        .expect("a failed receipt");
+    let e = r.error.as_deref().unwrap_or("");
+    assert!(
+        e.starts_with("agent produced no output (exit 1) after "),
+        "got: {e}"
+    );
+    assert_eq!(r.failure_class.as_deref(), Some("infra"));
+}
+
+/// A gate-passing attempt must never be lost to the operator's dirty
+/// checkout. Before: `git merge` ran, hit "local changes would be
+/// overwritten", and the 30-minute run was archived as a rejection (6
+/// receipts in the campaign). Now: dispatch parks until the
+/// checkout is clean, then the attempt runs and merges — and the
+/// operator's edit is untouched throughout.
+// spec: worktree/merge-serialization#dirty-merge-target-never-loses-the-attempt
+// spec: lifecycle/dispatch-waits-for-a-clean-merge-target#dirty-checkout-parks-dispatch-without-spending-an-attempt
+// spec: lifecycle/dispatch-waits-for-a-clean-merge-target#dispatch-resumes-when-the-checkout-is-clean
+#[test]
+fn dirty_merge_target_parks_dispatch_then_resumes_without_losing_the_attempt() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var("FAKE_AGENT_EXIT");
+    std::env::remove_var("FAKE_AGENT_EXIT_SILENT");
+    let f = fixture(
+        &format!(
+            r#"{{ "tasks": [ {{"id":"A","title":"x","scope":["DONE.txt"],"accept":"{g}"}} ] }}"#,
+            g = gate_cmd("DONE.txt")
+        ),
+        &worker_json(2),
+    );
+    // Operator leaves an uncommitted edit in the merge target.
+    std::fs::write(f.repo.join("notes.txt"), "operator wip\n").unwrap();
+    // One dispatch cycle: the task is parked, not attempted.
+    let st = Store::new(f.st.state_dir.clone());
+    let _ = run::run_loop(
+        &f.cfg,
+        &f.st,
+        &RunOptions {
+            once: true,
+            ..RunOptions::default()
+        },
+    );
+    assert_eq!(
+        st.load_receipts().len(),
+        0,
+        "no receipt: no attempt was spent on a dirty target"
+    );
+    // Parked — never `failed`, and the persisted status says WHY (so `af
+    // status` explains the stall from the state dir alone, not the log).
+    assert!(
+        !matches!(
+            st.load().get("A").map(|s| &s.state),
+            Some(TaskState::Failed)
+        ),
+        "parked, not failed"
+    );
+    let status_after = st.load();
+    let parked = status_after.get("A").expect("parked status is persisted");
+    assert_eq!(parked.state, TaskState::Ready);
+    let msg = parked.last_error.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("waiting: merge target dirty") && msg.contains("notes.txt"),
+        "status names the stall and the dirty path: {msg}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("notes.txt")).unwrap(),
+        "operator wip\n",
+        "af never touches the operator's working tree"
+    );
+    // Operator commits → dispatch resumes → merges.
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-m", "operator wip"]);
+    let code = run::run_loop(&f.cfg, &f.st, &RunOptions::default());
+    assert_eq!(code, 0);
+    assert_eq!(st.load()["A"].state, TaskState::Done);
+    assert!(f.repo.join("DONE.txt").exists(), "work merged once clean");
+    assert_eq!(st.load_receipts().len(), 1, "exactly one attempt");
 }
 
 /// --dry-run changes nothing.
@@ -858,6 +1004,7 @@ fn parallel_multi_worker_dispatch_runs_concurrently_and_merges() {
 
 /// Task on a repo that exists on disk but is not a git repo: the attempt
 /// fails cleanly (worktree error arm), task goes Failed with the reason.
+// spec: lifecycle/dispatch-waits-for-a-clean-merge-target#an-unreadable-target-is-the-attempts-error-not-a-park
 #[test]
 fn task_on_broken_repo_fails_cleanly() {
     let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());

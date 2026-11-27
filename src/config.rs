@@ -366,7 +366,7 @@ impl Default for WorkerDefaults {
 // Loaded config
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     pub tasks: Vec<Task>,
     pub workers: Vec<Worker>,
@@ -385,7 +385,7 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct TasksFile {
     #[serde(default)]
     _meta: Option<serde_json::Value>,
@@ -399,7 +399,7 @@ struct TasksFile {
     tasks: Vec<Task>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct WorkersFile {
     #[serde(default)]
     defaults: WorkerDefaults,
@@ -498,6 +498,27 @@ fn resolve_module_map_path(tasks_path: &Path, declared: &Path) -> PathBuf {
 fn cost_basis_is_usable(v: f64) -> bool {
     v.is_finite() && v > 0.0
 }
+
+/// Model ids with a hard, multi-campaign failure record on agentflow fleets
+/// — see `docs/workers.md` for the evidence ledger and the maintainer rule
+/// (a model earns a slot only after two independent campaigns confirm the
+/// failure, or an explicit operator directive; keep this list in sync with
+/// that file). `af validate` warns (never errors) when an ENABLED worker
+/// uses one, so a stale familiar config surfaces at load time instead of
+/// burning its retry budget. Matching is a case-insensitive substring over
+/// the declared model string, so prefixed route forms (`tud/kimi-k2.6`) and
+/// bare ids both hit.
+///
+/// - `kimi` (`tud/kimi-*`, `kimi-k2.6`): operator-excluded for the fleet
+///   fleet 2026-11-24 after drift + mid-task crashes in the OO 2.2/2.3
+///   campaigns (2026-10-10).
+///
+/// Deliberately NOT listed: `glm-5.2-awq`'s failure record is a
+/// concurrency/transport problem (self-saturation of its vLLM backend under
+/// parallel load: 74 s per 12 tokens, 2026-11-25), not model quality — the
+/// fix is a serialized instance (`max_in_flight: 1`), so it is a
+/// CONDITIONAL worker in docs/workers.md, not an exclusion.
+const KNOWN_PROBLEM_MODELS: &[&str] = &["kimi"];
 
 /// Returns warnings (non-fatal) or a hard error.
 fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
@@ -648,7 +669,7 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
             }
         }
     }
-    // Gate/scope mismatch (gate-scope lesson, 2026-10-14): a task scoped to
+    // Gate/scope mismatch (long-running campaign lesson, 2026-10-14): a task scoped to
     // a few crates whose accept runs a whole-workspace gate (the one
     // unambiguous cargo marker is `--workspace`) fails forever on
     // out-of-scope diagnostics, no matter how good the agent is. Non-fatal:
@@ -737,6 +758,21 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
         if w.enabled {
             enabled += 1;
         }
+        // A worker's `api_key_env` names the env var af passes to the agent
+        // (ADR-10 allowlist: the ONLY credential the agent child sees). If it
+        // names a variable that is unset in THIS environment, every attempt
+        // will be dispatched keyless and fail auth (or hang on a key prompt)
+        // before any model call — a whole campaign can burn its budget on
+        // it. Surfaced at validate time as a warning (not an error: some
+        // setups export the key only at dispatch time, e.g. wrapper scripts).
+        if let Some(k) = &w.api_key_env {
+            if std::env::var(k).ok().is_none_or(|v| v.is_empty()) {
+                warnings.push(format!(
+                    "worker '{}': api_key_env '{}' is not set in this environment — every builtin/allowlisted attempt runs keyless and will fail auth. Export it before \"af run\" (or set it in the dispatch shell), not inside the task.",
+                    w.name, k
+                ));
+            }
+        }
         // Declared cost basis: an UNUSABLE declared value (not finite, or
         // <= 0) is a hard error naming the worker and the field — a NaN or
         // non-positive weight would silently defeat cost comparison.
@@ -753,6 +789,21 @@ fn validate(tasks: &[Task], workers: &[Worker]) -> Result<Vec<String>, String> {
                     ));
                 }
             }
+        }
+        // A model id with a hard, recorded exclusion (docs/workers.md).
+        // Warn — never block (ADR-1 pass-through; a host may have a
+        // deliberate use) — so a stale familiar config surfaces at load
+        // time instead of a campaign burning its retry budget on it.
+        // Disabled workers never warn.
+        if w.enabled
+            && KNOWN_PROBLEM_MODELS
+                .iter()
+                .any(|bad| w.model.to_lowercase().contains(bad))
+        {
+            warnings.push(format!(
+                "worker \"{}\": model \"{}\" is on the excluded model list (docs/workers.md; KNOWN_PROBLEM_MODELS) — operator-directed after repeated campaign failures. Use a proven worker (zai/glm-5.3-flash, local/deepseek-v4-flash/ai1, tud/mistral-medium-3.5-128b) unless deliberate.",
+                w.name, w.model
+            ));
         }
         // No declared basis at all: one warning per worker, so `af
         // validate`'s warning count reflects the neutral estimate. Only
@@ -821,7 +872,7 @@ pub fn detect_cycle(tasks: &[Task]) -> Result<(), String> {
 /// each can be overridden via the environment under its canonical `AF_*`
 /// name (the legacy `TF_*` name still works as a fallback, with a one-time
 /// deprecation notice — see [`af_var`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Settings {
     pub repo_dir: PathBuf,
     pub state_dir: PathBuf,
@@ -1411,6 +1462,176 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("gate will be skipped")),
             "gate-less task should warn, not fail: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    // spec: config/api-key-env-unset-warns-at-validate-time
+    // long-running campaign lesson (2026-11-23): a worker whose api_key_env names a
+    // variable that is unset in the dispatch environment runs every attempt
+    // keyless — the port-1000 loop burned its whole 1092-run budget that
+    // way (`No API key found for openai.` on every agent, zero merges).
+    // Detectable before dispatch, so flag it at validate time.
+    fn api_key_env_unset_warns() {
+        let d = tmpdir("cfg-keyset");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"m","api_key_env":"AF_TEST_KEY_THAT_IS_UNSET_987654321"}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("api_key_env") && w.contains("not set in this environment")),
+            "unset api_key_env should warn at validate time: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn api_key_env_set_does_not_warn() {
+        // Guard: a worker whose api_key_env is set in the environment must
+        // NOT trigger the unset warning (as opposed to failing closed and
+        // warning on every valid config).
+        let d = tmpdir("cfg-keyset2");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        std::env::set_var("AF_TEST_KEY_SET_123456789", "sk-test");
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"m","api_key_env":"AF_TEST_KEY_SET_123456789"}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            !c.warnings
+                .iter()
+                .any(|w| w.contains("not set in this environment")),
+            "set api_key_env should not warn: {:?}",
+            c.warnings
+        );
+        std::env::remove_var("AF_TEST_KEY_SET_123456789");
+    }
+
+    #[test]
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#enabled-worker-on-a-known-problem-model-warns
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#prefixed-route-form-and-case-also-match
+    // long-running campaign: Kimi is operator-excluded (2026-11-24 directive) after
+    // drift + mid-task crashes (OO 2.2/2.3, 2026-10-10) — docs/workers.md
+    // and KNOWN_PROBLEM_MODELS. The warning exists so a stale familiar
+    // workers.json surfaces at validate time instead of a campaign burning
+    // its retry budget on it.
+    // NOTE: tud/glm-5.2-awq is intentionally NOT here — its stalls are
+    // backend self-saturation under parallel load, handled by defaulting it
+    // to max_in_flight: 1 (CONDITIONAL in docs/workers.md), not exclusion.
+    fn known_problem_model_warns_on_enabled_worker() {
+        for model in ["tud/kimi-k2.6", "kimi"] {
+            let d = tmpdir("cfg-badmodel");
+            wt(
+                &d.join("tasks.json"),
+                r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+            );
+            wt(
+                &d.join("workers.json"),
+                &format!(
+                    r#"{{ "workers": [{{"name":"w1","provider":"litellm","model":"{model}"}}] }}"#
+                ),
+            );
+            let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+            assert!(
+                c.warnings.iter().any(|w| {
+                    w.contains("excluded model list")
+                        && w.contains("docs/workers.md")
+                        && w.contains("w1")
+                }),
+                "excluded model '{model}' should warn: {:?}",
+                c.warnings
+            );
+        }
+    }
+
+    #[test]
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#prefixed-route-form-and-case-also-match
+    fn known_problem_model_matches_case_insensitively() {
+        let d = tmpdir("cfg-badmodel-case");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"tud/Kimi-K2.6"}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            c.warnings.iter().any(|w| w.contains("excluded model list")),
+            "mixed-case Kimi route should warn: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#glm-5-2-awq-is-not-excluded-and-concurrency-is-the-fix
+    fn glm_52_awq_does_not_warn() {
+        let d = tmpdir("cfg-awq");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"tud/glm-5.2-awq","max_in_flight":1}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            !c.warnings.iter().any(|w| w.contains("excluded model list")),
+            "awq is conditionally usable (serialized), not excluded: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#disabled-worker-on-a-known-problem-model-does-not-warn
+    fn known_problem_model_does_not_warn_when_disabled() {
+        let d = tmpdir("cfg-badmodel-disabled");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"tud/kimi-k2.6","enabled":false},{"name":"w2","provider":"litellm","model":"zai/glm-5.3-flash"}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            !c.warnings.iter().any(|w| w.contains("excluded model list")),
+            "disabled worker must not warn: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    // spec: config/worker-validation-warns-on-known-problem-model-ids#a-proven-worker-never-warns
+    fn proven_worker_never_warns() {
+        let d = tmpdir("cfg-goodmodel");
+        wt(
+            &d.join("tasks.json"),
+            r#"{ "tasks": [{"id":"A","title":"x","accept":"true"}]}"#,
+        );
+        wt(
+            &d.join("workers.json"),
+            r#"{ "workers": [{"name":"w1","provider":"litellm","model":"zai/glm-5.3-flash"}]}"#,
+        );
+        let c = load(&d.join("tasks.json"), &d.join("workers.json")).unwrap();
+        assert!(
+            !c.warnings.iter().any(|w| w.contains("excluded model list")),
+            "proven model must never warn: {:?}",
             c.warnings
         );
     }

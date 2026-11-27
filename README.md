@@ -140,6 +140,10 @@ a litellm proxy, a local vLLM…); `api_key_env` names the env var af reads the
 key from. This worker uses `"cli": "builtin"` — af's native in-process harness
 — so no external agent CLI is installed on this machine.
 
+Workers that have a proven (or chronic-failure) record on real campaigns are
+listed in [`docs/workers.md`](docs/workers.md) (`af validate` warns when a
+worker names an excluded model id).
+
 ### 4. Point af at your repository
 
 ```sh
@@ -742,14 +746,33 @@ data stays measured; the smoothed version is the routing term only.)
 
 A **failure class** tells the router whose fault a failure was. Every failed
 receipt records `failure_class`: `"infra"` when the harness, transport or
-environment failed (provider error, timeout, stall watchdog, missing
-binary, git/io error, native-harness turn cap) and `"agent"` when the work
-itself was judged wrong (non-zero exit, gate failure, scope violation, zero
-commits). An `infra` failure is **not a verdict**: it never enters `WINS` or
+environment failed (provider error, missing API key, transport abort,
+timeout, stall watchdog, missing binary, git/io error, a silent agent,
+native-harness turn cap) and `"agent"` when the work itself was judged
+wrong (a non-zero exit whose output names no infra signal, gate failure,
+scope violation, zero commits). The reason is the agent's **own**
+diagnosis, not just its exit wrapper: a CLI failure with no committed work
+reads `agent exited NonZero (code 1); last output: <cause line>` — the
+first output line that names an infra signal (CLIs print the cause first,
+then remediation hints and a docs path), else the last line — and a worker
+that wrote nothing reads `agent produced no output (exit N) after Ts`. So
+a misconfigured provider (`No API key found for openai.`) is visible in
+`af status` as an `infra` fault, not buried as 160 identical `code 1`s.
+An `infra` failure is **not a verdict**: it never enters `WINS` or
 `TOTAL`, so a provider outage or a turn-cap death stops poisoning a worker's
 trust (it still burns one `max_attempts` retry and its tokens still count in
 `af cost`). An `agent` failure lowers trust exactly as before. `af status
 --json` surfaces each task's latest `failure_class` (`null` when none).
+
+**Dirty merge target**: `af` never merges into a dirty checkout. Before
+dispatching, it checks the merge target; if the operator has uncommitted
+changes, the dispatch is **parked** — no attempt spent, no receipt, the log
+names the dirty path once, `af status` shows `waiting: merge target dirty
+(<path>)` — and resumes by itself the moment the checkout is clean. As a
+backstop, `worktree::merge` refuses a dirty target before running `git
+merge`, never touching the operator's tree, and the attempt branch is kept
+for `af recover`. A gate-passing 30-minute run is never lost to a stray
+`M` in `git status`.
 
 **Cascade (escalation) routing** is the per-task counterweight to the global
 router: a task may declare `cascade: ["cheap", "pro"]` to start the

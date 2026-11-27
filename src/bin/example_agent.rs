@@ -82,7 +82,16 @@ fn main() -> ExitCode {
         .unwrap_or_else(|_| "example-agent: task complete".to_string());
 
     if exit != 0 {
-        eprintln!("example_agent: failing with exit {exit}");
+        // `FAKE_AGENT_EXIT_SILENT`: model a real agent's crash line (or a
+        // fully silent death when `FAKE_AGENT_OUT` is empty) instead of the
+        // fixed banner — so the receipt-diagnosis path can be exercised.
+        if std::env::var("FAKE_AGENT_EXIT_SILENT").is_ok() {
+            if !out.is_empty() {
+                eprintln!("{out}");
+            }
+        } else {
+            eprintln!("example_agent: failing with exit {exit}");
+        }
         return ExitCode::from(exit.clamp(0, 255) as u8);
     }
     // Watchdog-test knob: hang BEFORE writing any output — the stub stays

@@ -23,6 +23,7 @@ sequenceDiagram
     S->>S: check budget cap (AF_MAX_WALL_CLOCK_S)
     S->>S: build ready queue (deps met, ≤ max parallel, no contention)
     S->>S: deadlock check → exit 2 if blocked
+    S->>S: dirty-target pre-flight (park dispatch if merge checkout is dirty)
     S->>R: pick free worker by UCB1 (trust + exploration + cost/duration tie-break)
     alt ready task & free worker
       S->>E: dispatch task on worker
@@ -94,7 +95,8 @@ ever save money.
   first-try merges, and other workers' dispatches are never delayed.
 - **Adaptive per-worker backoff**: a worker whose attempt fails as
   infrastructure (`failure_class: "infra"` — provider 4xx/5xx, rate limit,
-  transport/harness timeout) is cooled down before it can be picked again,
+  missing API key, transport abort, harness timeout) is cooled down before
+  it can be picked again,
   escalating 30 s → 60 s → 120 s → 240 s → 300 s ceiling. Any verdict
   (merged, verified, or non-infra failed) resets the escalation to level 0.
   A solo worker (only one enabled) is capped at 30 s so the campaign keeps

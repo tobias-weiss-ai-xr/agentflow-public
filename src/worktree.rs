@@ -356,6 +356,13 @@ pub fn commits_ahead(repo: &Path, base: &str, branch: &str) -> Result<u64, Strin
 /// at `path`? `git status --porcelain` is non-empty exactly when the tree
 /// differs from its HEAD. An unreadable status is an error, never "clean".
 pub fn is_dirty(path: &Path) -> Result<bool, String> {
+    Ok(first_dirty_path(path)?.is_some())
+}
+
+/// The first path `git status --porcelain` reports for the worktree at
+/// `path` (the `XY <path>` record's path), `None` when clean. Unreadable
+/// status is an error, never "clean" — callers fail safe.
+pub fn first_dirty_path(path: &Path) -> Result<Option<String>, String> {
     let out = git(path, &["status", "--porcelain"]);
     if !out.passed() {
         return Err(format!(
@@ -364,7 +371,14 @@ pub fn is_dirty(path: &Path) -> Result<bool, String> {
             out.combined().trim()
         ));
     }
-    Ok(!out.stdout.trim().is_empty())
+    // `XY <path>` (XY = two status columns, e.g. ` M`, `??`). Renames read
+    // `R  old -> new`; the new path is what the operator would recognise.
+    Ok(out
+        .stdout
+        .lines()
+        .map(str::trim_end)
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l[3..].trim().to_string()))
 }
 
 /// Make the agent's work DURABLE on the attempt branch: commit every
@@ -442,8 +456,18 @@ pub fn attach_existing(
 
 /// Serialized merge of `branch` into the repo's current checkout branch.
 /// On conflict: aborts the merge and returns an error (never force-pushes).
+/// Pre-flight: a dirty merge target is refused BEFORE `git merge` runs — the
+/// operator's working tree is never touched (nothing to stash, nothing to
+/// abort) and the attempt is preserved for recovery once the tree is clean.
+/// long-running campaign lesson (2026-11-24): 6 gate-passing 30-minute runs were
+/// lost to `Your local changes would be overwritten by merge`.
 pub fn merge(repo: &Path, branch: &str, locks: &MergeLocks, msg: &str) -> Result<(), String> {
     let _guard = locks.0.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(p) = first_dirty_path(repo)? {
+        return Err(format!(
+            "merge target is dirty ({p}); commit or stash before af merges"
+        ));
+    }
     let out = git(repo, &["merge", "--no-ff", branch, "-m", msg]);
     if out.passed() {
         return Ok(());
@@ -732,6 +756,41 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+        remove(&repo, &wt);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    // spec: worktree/merge-serialization#dirty-merge-target-never-loses-the-attempt
+    // long-running campaign lesson (2026-11-24): `git merge` into a dirty checkout
+    // fails with "local changes would be overwritten" and cost 6 successful
+    // runs. The guard must refuse BEFORE merging and leave the tree alone.
+    #[test]
+    fn merge_refuses_a_dirty_target_without_touching_it() {
+        let repo = scratch_repo();
+        let locks = MergeLocks::new();
+        let wt = create_ok(&repo, &repo.parent().unwrap().join("wt"), "T3");
+        // Operator's uncommitted edit in the merge target.
+        std::fs::write(repo.join("notes.txt"), "operator wip\n").unwrap();
+        let err = merge(&repo, &wt.branch, &locks, "merge T3").unwrap_err();
+        assert!(
+            err.contains("merge target is dirty (notes.txt)"),
+            "got: {err}"
+        );
+        // Nothing ran: no merge in progress, edit intact, branch still exists.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "operator wip\n"
+        );
+        assert!(!repo.join(".git").join("MERGE_HEAD").exists());
+        let out = Command::new("git")
+            .args(["rev-parse", "--verify", &wt.branch])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "attempt branch preserved for recovery"
+        );
         remove(&repo, &wt);
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }

@@ -6,6 +6,7 @@
 /config/workers.json
 *.log
 result*
+!src/run/results.rs
 /state-lw
 
 # Local campaign runtime artifacts (per-campaign configs, state dirs, launch
@@ -31,5 +32,7 @@ result*
 
 /config/self-improve/
 /state-self-improve/
+# af state dirs (AF_STATE_DIR default dirs and local campaign state).
+/.af-state-*/
 __pycache__/
 /gen-*.py

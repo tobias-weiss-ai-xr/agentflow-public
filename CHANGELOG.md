@@ -5,18 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.1] - 2026-11-12
+## [Unreleased]
+
+### Fixed
+
+- **Failure receipts carry the agent's own diagnosis.** A CLI worker that
+  exits non-zero with no committed work now records `agent exited NonZero
+  (code 1); last output: <cause line>` — the first output line that names an
+  infra signal (CLIs print the cause first, then remediation hints and a
+  docs path), else the last line — and a worker that wrote nothing records
+  `agent produced no output (exit N) after Ts`. `classify_failure` learns the
+  vocabulary agents actually emit (`aborted`, `api key`, `not found for
+  provider`, `429`, `503`, `rate limit`, `overloaded`, `socket`, `eof`,
+  `reset by peer`, `dns`, `empty response`, `no output`), so transport and
+  configuration faults classify as `infra` and no longer lower worker trust.
+  Re-running the classifier over the archived port-1000 receipts
+  (240 receipts; 190 `agent` / 38 `infra` as recorded) moves **168 → infra**
+  (22 `agent` / 206 `infra`). The 164 identical 5-second deaths behind it
+  were a misconfigured provider (`No API key found for openai.`), invisible
+  for a day behind `code 1`.
+- **`af` never merges into a dirty checkout.** `worktree::merge` pre-flights
+  the merge target and refuses with `merge target is dirty (<path>); commit
+  or stash before af merges` — nothing runs, the operator's tree is untouched,
+  the attempt branch is kept for `af recover`. The dispatch loop parks a
+  task whose merge target is dirty (no receipt, no attempt spent; logged
+  once; `af status` shows `waiting: merge target dirty (<path>)`) and
+  resumes automatically once the checkout is clean.
+
+## [0.1.1] - 2026-11-09
 
 ### Added
 
-- **Dynamic worker pool** — `AF_MAX_PARALLEL=0` (default) sets the pool to the current enabled-worker count, recomputed on every hot reload; no restart needed to grow or shrink the pool. An explicit `AF_MAX_PARALLEL=N` stays a fixed ceiling.
-- **Per-task context** — `Task.context` (string or string array) renders into the agent prompt via `{{CONTEXT}}`; `{{#CONTEXT}}…{{/CONTEXT}}` conditional sections drop entirely when unset; templates omitting `{{CONTEXT}}` get an appended `## Task context` section + warning.
-- **`AF_PROMPT_FILE` env var** — override the prompt-template path per campaign (legacy `TF_PROMPT_FILE` fallback with deprecation notice); template is re-read for every rendered prompt.
-- **`{{PREVIOUS_ERROR}}`** — retry-failure block substitutes the prior attempt's error into the token; attempt 1 renders it empty.
-- **Gate-failure tail on receipts** — gate errors now show the last ≤200 chars of gate output (boundary-aware) instead of the first line; silent gates get `(gate produced no output; exit N)`.
-- **Repeated identical gate failure stops early** — two matching gate fingerprints (exit code + normalized tail) with `attempts ≥ 2` → `TaskState::Failed` with `task design defect` reason; detection uses persisted receipts and survives resume.
-- **Adaptive per-worker backoff** — infra failures escalate 30→60→120→240→300 s; any verdict resets; solo worker capped at 30 s.
-- **INFRA column in `af cost`** — per-worker infra-failure count + footnote; all-healthy report byte-identical.
 - Add `docs/recipes.md` — campaign recipes cookbook with ready-to-run orchestration patterns.
 - Add `docs/troubleshooting.md` — guide to common failure modes and their remedies.
 - Add `docs/quickstart.md` — expanded five-minute walkthrough from install to first merged campaign.
@@ -29,15 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add transcript edge-case test coverage.
 - Add worker cost-basis documentation.
 - Add tag-triggered release workflow: x64 native + arm64 cross builds, tarballs + `SHA256SUMS`, release notes from this changelog.
-- Add `docs/module-map.md` — module-map schema and `af validate` scope-contention usage.
-- Add `examples/module-map.example.json` — example module map for ADR-16.
-- Add `docs/postmortem-template.md` — template for campaign postmortems.
 
 ### Fixed
 
 - Fix `Config` test initializers missing the new `module_map` field (merge gap between `mm-config` and pre-existing tests).
 - Fix `scripts/dist/` shallow clones fetching no tags (version fell back to bare `0.1.0`); dist builds are now produced by the release workflow.
-- Remove dead `{{EPISODES}}`/`{{MISSION}}` placeholders from shipped `prompts/worker.md`.
 
 ## [0.1.0] - 2026-11-07
 
@@ -82,6 +97,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - N/A — initial release.
 
-[unreleased]: https://github.com/tobias-weiss-ai-xr/agentflow/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/tobias-weiss-ai-xr/agentflow/releases/tag/v0.1.1
-[0.1.0]: https://github.com/tobias-weiss-ai-xr/agentflow/releases/tag/v0.1.0
+[unreleased]: https://github.com/agentflow/agentflow/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/agentflow/agentflow/releases/tag/v0.1.0

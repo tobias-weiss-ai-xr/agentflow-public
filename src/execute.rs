@@ -5,6 +5,7 @@
 
 use crate::config::{Config, Settings, Worker};
 use crate::state::{now_ts, AttemptPhase, ContractVerdict, Receipt, Store};
+use crate::subprocess::CmdOut;
 use crate::{gate, worktree};
 use std::fs;
 use std::io::Write;
@@ -124,7 +125,7 @@ fn outcome_name(o: &Outcome) -> &'static str {
 /// agree.
 pub fn classify_failure(error: &str) -> &'static str {
     let e = error.to_ascii_lowercase();
-    const INFRA: [&str; 8] = [
+    const INFRA: [&str; 21] = [
         "harness",    // native harness failures incl. `turn cap`, provider error, `stop=Timeout`
         "timeout",    // total agent timeout
         "stall",      // stall watchdog
@@ -133,6 +134,26 @@ pub fn classify_failure(error: &str) -> &'static str {
         "cannot",     // git/io errors: cannot write prompt, cannot commit, cannot compute diff
         "provider",   // explicit provider errors
         "connection", // transport
+        // Transport vocabulary CLI agents print on the way down (long-running campaign
+        // receipt forensics, 2026-11-24: `Request was aborted` alone was 160
+        // of 167 "agent" failures). Only reachable once the agent's last
+        // output line is on the reason — see `last_output_line`.
+        "aborted",
+        "empty response",
+        "rate limit",
+        "429",
+        "503",
+        "overloaded",
+        "socket",
+        "eof",
+        "reset by peer",
+        "dns",
+        "no output", // silent death: nothing on either pipe
+        // Credential/config faults the CLI reports as a plain message and
+        // exits 1: the 164-death incident was literally
+        // `No API key found for openai.` — classified "agent" for a day.
+        "api key",
+        "not found for provider",
     ];
     for sig in INFRA {
         if e.contains(sig) {
@@ -140,6 +161,47 @@ pub fn classify_failure(error: &str) -> &'static str {
         }
     }
     "agent"
+}
+
+/// The agent's own diagnosis: the LAST non-empty line of its combined
+/// output, ANSI escapes stripped, capped at 160 chars. `None` when the agent
+/// wrote nothing (the caller names the silent death instead). This is what
+/// makes a CLI transport abort classifiable — the exit wrapper says only
+/// `NonZero (code 1)`; the agent says `Request was aborted`.
+pub fn last_output_line(out: &CmdOut) -> Option<String> {
+    let strip = |s: &str| -> String {
+        // ponytail: CSI sequences only (ESC [ ... final-byte); enough for
+        // colour codes, which is all agents emit on a crash line.
+        let mut it = s.chars().peekable();
+        let mut o = String::new();
+        while let Some(c) = it.next() {
+            if c == '\u{1b}' && it.peek() == Some(&'[') {
+                it.next();
+                for f in it.by_ref() {
+                    if f.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                o.push(c);
+            }
+        }
+        o
+    };
+    let combined = out.combined();
+    let lines: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Prefer the FIRST line that names a cause over the literal last line:
+    // CLIs follow the cause (`No API key found for openai.`) with remediation
+    // hints (`Use /login … API key … <docs path>`); the cause comes first.
+    lines
+        .iter()
+        .find(|l| classify_failure(l) == "infra")
+        .or_else(|| lines.last())
+        .map(|l| strip(l).chars().take(160).collect())
 }
 
 /// Truncate a gate-failure reason to the TAIL of the gate's combined
@@ -310,7 +372,7 @@ fn failure_context(receipts: &[Receipt], task_id: &str, attempt: u32) -> Option<
 /// speculative. ponytail: env knob only if long-horizon tasks ever need >128.
 const TURN_CAP_CEILING: u32 = 128;
 
-/// Turn-cap escalation (turn-cap lesson, 2026-10-14): a turn-cap failure
+/// Turn-cap escalation (long-running campaign lesson, 2026-10-14): a turn-cap failure
 /// is a BUDGET signal, not a quality signal. If any earlier failed attempt of
 /// this task died at `harness: turn cap N reached`, the retry runs with
 /// `2 × max(N)`, clamped to [`TURN_CAP_CEILING`]; otherwise the configured
@@ -379,7 +441,7 @@ fn execute_attempt(
     // Attempt start: the no-change failure names how long the attempt ran.
     let attempt_start = std::time::Instant::now();
     let task = match ctx.cfg.by_id.get(id) {
-        Some(t) => t.clone(),
+        Some(t) => t,
         None => {
             return (
                 Outcome::Failed(format!("unknown task {id}")),
@@ -390,7 +452,7 @@ fn execute_attempt(
     };
 
     // Multi-repo (ADR-11): worktree, branch, and merge target the task's repo.
-    let repo = ctx.cfg.repo_dir_for(&task, &ctx.st.repo_dir);
+    let repo = ctx.cfg.repo_dir_for(task, &ctx.st.repo_dir);
     // Cost fix (gate flakes must not discard paid agent work): when the
     // agent's committed work is still durable on the attempt branch — a
     // previous attempt of this task failed ONLY at the gate — attach to
@@ -401,7 +463,7 @@ fn execute_attempt(
             Ok(w) => w,
             Err(e) => return (Outcome::Failed(e), Spend::default(), None),
         };
-    let wt_path = wt.path.clone();
+    let wt_path = &wt.path;
     // Token usage lifted out of the agent's JSON transcript, when the
     // worker opted into json output mode. Every failure path that did not
     // run the agent reports `None`.
@@ -445,7 +507,7 @@ fn execute_attempt(
         // 1) Render + write prompt.
         let prompt = {
             let context = failure_context(&ctx.store.load_receipts(), id, attempt);
-            render_prompt(&ctx.st, &task, worker, context.as_deref())
+            render_prompt(&ctx.st, task, worker, context.as_deref())
         };
         // Absolute: the prompt path crosses the process boundary into the
         // agent's cwd (a worktree) — a relative state_dir would point at a
@@ -474,9 +536,9 @@ fn execute_attempt(
         let (agent_cmd, agent_args) = match &worker.command {
             Some(tpl) => command_argv(tpl, &prompt_path),
             None => {
-                let argv = spawn_argv(&ctx.st, worker, &prompt_path);
-                let (c, a) = argv.split_first().unwrap();
-                (c.clone(), a.to_vec())
+                let mut argv = spawn_argv(&ctx.st, worker, &prompt_path).into_iter();
+                let c = argv.next().unwrap_or_default();
+                (c, argv.collect())
             }
         };
         let (env_pairs_static, env_allow) = agent_env(worker, &|k| std::env::var(k).ok());
@@ -502,7 +564,7 @@ fn execute_attempt(
             let out = crate::harness::run(
                 worker,
                 &prompt,
-                &wt_path,
+                wt_path,
                 &ctx.st,
                 escalate_turns(&ctx.store.load_receipts(), id, attempt, task.max_turns),
                 &task.scope,
@@ -540,7 +602,7 @@ fn execute_attempt(
             crate::subprocess::run_with_stall(
                 &agent_cmd,
                 &agent_args,
-                Some(&wt_path),
+                Some(wt_path),
                 &env_pairs,
                 env_mode,
                 Duration::from_secs(ctx.st.agent_timeout_s),
@@ -608,8 +670,11 @@ fn execute_attempt(
                 cleanup(&repo, &wt);
                 // Same single failure path, distinct diagnosis: a stall names
                 // the configured window (it is a different disease than "ran
-                // out of total time"), every other failure keeps the
-                // historical "agent exited …" shape that callers match on.
+                // out of total time"); a silent agent is named as such; every
+                // other failure keeps the historical "agent exited …" shape
+                // that callers match on, now carrying the agent's LAST output
+                // line so `classify_failure` sees the real cause (`Request
+                // was aborted`) rather than the exit wrapper alone.
                 let reason = if agent_out.kind == crate::subprocess::CmdKind::Stalled {
                     format!(
                         "agent stalled: produced no output for {}s (stall window, AF_AGENT_STALL_S={}); killed before agent_timeout_s={}",
@@ -618,14 +683,23 @@ fn execute_attempt(
                         ctx.st.agent_timeout_s
                     )
                 } else {
-                    format!(
-                        "agent exited {:?} (code {})",
-                        agent_out.kind,
-                        agent_out
-                            .code
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "-".into())
-                    )
+                    let exit = agent_out
+                        .code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    match last_output_line(&agent_out) {
+                        // ponytail: Stalled/Timeout kills snapshot output
+                        // best-effort; `last_output_line` is still honest
+                        // (whatever was captured) for those kinds too.
+                        Some(line) => format!(
+                            "agent exited {:?} (code {exit}); last output: {line}",
+                            agent_out.kind
+                        ),
+                        None => format!(
+                            "agent produced no output (exit {exit}) after {}s",
+                            attempt_start.elapsed().as_secs()
+                        ),
+                    }
                 };
                 // The spend was real (and captured) even though the attempt
                 // failed — the receipt is the cost ledger.
@@ -680,7 +754,7 @@ fn execute_attempt(
         // not make durable. No `--no-verify`: the operator's hooks are
         // theirs to run.
         if let Err(e) = worktree::commit_all(
-            &wt_path,
+            wt_path,
             &format!("af: {id} attempt {attempt} — agent left uncommitted work"),
         ) {
             let kept = preserve_and_note(&repo, &wt, id, attempt, &mut append);
@@ -745,7 +819,7 @@ fn execute_attempt(
                 return (Outcome::Failed(format!("{e}{kept}")), spend, None);
             }
         };
-        let changed = match changed_paths(&wt_path, &base_branch) {
+        let changed = match changed_paths(wt_path, &base_branch) {
             Ok(c) => c,
             Err(e) => {
                 let kept = preserve_and_note(&repo, &wt, id, attempt, &mut append);
@@ -789,7 +863,7 @@ fn execute_attempt(
             append("-- gate --");
             let gate_out = gate::run_accept(
                 accept,
-                &wt_path,
+                wt_path,
                 &ctx.st.gate_env,
                 Duration::from_secs(ctx.cfg.defaults.accept_timeout_s),
                 task.gate_replay,
@@ -847,7 +921,7 @@ fn execute_attempt(
         // `verified`, and per-contract verdicts from an optional
         // `accept_report.json` ride the receipt.
         append("-- verify passed; archiving branch (no merge) --");
-        let contracts = parse_accept_report(&wt_path);
+        let contracts = parse_accept_report(wt_path);
         if let Some(c) = &contracts {
             append(&format!(
                 "-- accept_report: {} --",
@@ -895,7 +969,7 @@ fn execute_attempt(
     // accept_report.json in the worktree root; read it BEFORE cleanup (which
     // deletes the worktree dir). Absent/unparseable report -> None, exactly
     // like the verify path - the file is optional detail, never authority.
-    let contracts = parse_accept_report(&wt_path);
+    let contracts = parse_accept_report(wt_path);
     cleanup(&repo, &wt);
     (Outcome::Merged, spend, contracts)
 }
@@ -1160,14 +1234,14 @@ pub fn render_prompt(
     };
     let acceptance = task
         .acceptance_prose
-        .clone()
-        .unwrap_or_else(|| "(declared acceptance gate command)".to_string());
+        .as_deref()
+        .unwrap_or("(declared acceptance gate command)");
     // The EXACT shell command the acceptance gate will run (gate.rs) — the
     // agent must see it verbatim, not a prose paraphrase.
     let accept_cmd = task
         .accept
-        .clone()
-        .unwrap_or_else(|| "(no acceptance gate command — manual task)".to_string());
+        .as_deref()
+        .unwrap_or("(no acceptance gate command — manual task)");
     // Per-task crafted context (the operator's "mission" beyond the
     // acceptance prose): replaces `{{CONTEXT}}`; empty when the task
     // declares none. The `{{#CONTEXT}}…{{/CONTEXT}}` conditional section
@@ -1186,8 +1260,8 @@ pub fn render_prompt(
         ("{{TASK_ID}}", task.id.as_str()),
         ("{{TASK_TITLE}}", task.title.as_str()),
         ("{{SCOPE}}", &scope),
-        ("{{ACCEPTANCE}}", &acceptance),
-        ("{{ACCEPT_CMD}}", &accept_cmd),
+        ("{{ACCEPTANCE}}", acceptance),
+        ("{{ACCEPT_CMD}}", accept_cmd),
         ("{{MODEL}}", worker.model.as_str()),
         ("{{PROVIDER}}", worker.provider.as_str()),
         ("{{CONTEXT}}", task_context.as_deref().unwrap_or("")),
@@ -1344,6 +1418,7 @@ fn render_conditional_section(rendered: &str, name: &str, active: bool) -> Strin
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use crate::subprocess::CmdKind;
     use std::path::PathBuf;
 
     fn worker(api_key_env: Option<&str>) -> Worker {
@@ -1719,6 +1794,81 @@ mod tests {
         for e in agent {
             assert_eq!(classify_failure(e), "agent", "expected agent for: {e}");
         }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#a-cli-transport-abort-is-infra
+    // spec: state/failure-class-on-receipts#a-silent-cli-death-is-named
+    // receipt forensics (2026-11-24): 160 of 167 "agent"
+    // failures were 5–7s transport aborts whose cause lived only in the
+    // per-task log. With the last output line on the reason, the same
+    // single classifier sees the real signal.
+    fn classify_failure_reads_the_agents_last_output_line() {
+        let infra = [
+            "agent exited NonZero (code 1); last output: Request was aborted",
+            "agent exited NonZero (code 1); last output: Error: socket hang up ECONNRESET",
+            "agent exited NonZero (code 1); last output: 429 Too Many Requests",
+            "agent exited NonZero (code 1); last output: provider empty response (no text, no tool_calls)",
+            "agent produced no output (exit 1) after 5s",
+            // The verbatim last line of the 164-death incident.
+            "agent exited NonZero (code 1); last output: No API key found for openai.",
+            "agent exited NonZero (code 1); last output: Error: Model \"tud/x\" not found for provider \"openai\"",
+        ];
+        for e in infra {
+            assert_eq!(classify_failure(e), "infra", "expected infra for: {e}");
+        }
+        let agent = [
+            "agent exited NonZero (code 1); last output: Error: file not found: foo.rs",
+            "agent exited NonZero (code 1); last output: error: expected 3 arguments, found 2",
+        ];
+        for e in agent {
+            assert_eq!(classify_failure(e), "agent", "expected agent for: {e}");
+        }
+    }
+
+    #[test]
+    // spec: state/failure-class-on-receipts#a-cli-crash-report-with-a-trailing-docs-pointer-names-the-cause
+    fn last_output_line_picks_last_nonempty_line_strips_ansi_and_caps() {
+        let mk = |s: &str, e: &str| CmdOut {
+            kind: CmdKind::NonZero,
+            code: Some(1),
+            stdout: s.into(),
+            stderr: e.into(),
+        };
+        // stderr after stdout wins (combined order); blank lines skipped.
+        assert_eq!(
+            last_output_line(&mk("step 1\nstep 2\n", "\nRequest was aborted\n")),
+            Some("Request was aborted".into())
+        );
+        // ANSI colour escapes are stripped so the classifier sees words.
+        assert_eq!(
+            last_output_line(&mk("", "\u{1b}[31mError: socket hang up\u{1b}[0m")),
+            Some("Error: socket hang up".into())
+        );
+        // Long lines are capped at 160 chars so the receipt stays readable.
+        let long = "x".repeat(400);
+        assert_eq!(last_output_line(&mk("", &long)).map(|l| l.len()), Some(160));
+        // No output at all → None (caller emits the silent-death reason).
+        assert_eq!(last_output_line(&mk("", " \n")), None);
+        // The verbatim pi crash report of the 164-death incident:
+        // the real cause sits ABOVE a trailing docs pointer. The cause wins
+        // over the literal last line — this is the whole point of the fix.
+        let incident = "Warning: Model \"tud/x\" not found for provider \"openai\". Using custom model id.\n\
+                       No API key found for openai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  \
+                       /home/u/.bun/install/global/node_modules/pi/docs/providers.md\n  \
+                       /home/u/.bun/install/global/node_modules/pi/docs/models.md";
+        let line = last_output_line(&mk("", incident)).unwrap();
+        // Either cause line is right; the trailing docs pointer is wrong.
+        assert!(
+            line.contains("No API key") || line.contains("not found for provider"),
+            "got a non-cause line: {line}"
+        );
+        assert_eq!(
+            classify_failure(&format!(
+                "agent exited NonZero (code 1); last output: {line}"
+            )),
+            "infra"
+        );
     }
 
     #[test]

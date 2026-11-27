@@ -7,7 +7,7 @@ or the receipts under the state dir. This page covers the common failure
 modes and the exact commands that answer them.
 
 The state dir defaults to `state/` and can be moved with `AF_STATE_DIR`
-(e.g. `state-self-improve/`, `state-piws/`). Substitute your state dir for
+(e.g. `state-campaign-a/`, `state-campaign-b/`). Substitute your state dir for
 `<state>` throughout.
 
 ## First stop: `af status` and the run log

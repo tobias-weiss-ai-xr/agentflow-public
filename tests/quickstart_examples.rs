@@ -55,6 +55,11 @@ fn write_file(path: &std::path::Path, content: &str) -> PathBuf {
 fn quickstart_examples_load_and_validate() {
     let d = fresh_dir("examples");
 
+    // load() warns when a worker's api_key_env is unset in THIS environment —
+    // in CI ZAI_API_KEY is never set, so without a dummy the warning count is
+    // 2 and the "exactly 1 warning" assertion fails. Pin the env the test
+    // means to exercise.
+    std::env::set_var("ZAI_API_KEY", "test-dummy");
     let tasks_path = write_file(&d.join("tasks.json"), README_TASKS_JSON);
     let workers_path = write_file(&d.join("workers.json"), README_WORKERS_JSON);
 

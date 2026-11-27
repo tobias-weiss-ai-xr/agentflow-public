@@ -17,8 +17,9 @@ gate (see below).
 cargo build --release
 ```
 
-This produces the `af` binary at `target/release/af`. The repo also builds an
-`example_agent` binary (a stub worker used by tests and local experiments):
+This produces the `af` binary at `target/release/af`. The repo also builds
+an `example_agent` binary (a stub worker used by tests and local
+experiments):
 
 ```sh
 cargo build --release --bin example_agent
@@ -98,6 +99,16 @@ runtime view, update the relevant chapter in the same PR. Other docs:
 
 ## Pull requests
 
+Every PR must satisfy the full acceptance gate before it merges:
+
 1. Fork/branch, keep the change focused, and follow the openspec flow above.
-2. `make check` green, and `./scripts/coverage-gate.sh` at or above the floor.
-3. Describe what changed and link the openspec change directory.
+2. **`make check` must pass** — this runs `cargo fmt`, `cargo clippy
+   --all-targets -- -D warnings`, and `cargo test` (fmt + clippy + tests)
+   together. Also run `./scripts/coverage-gate.sh` and keep the line-coverage
+   floor at or above `.coverage-min`.
+3. **Architecture docs must stay current:** if the change alters module
+   structure (adds, removes, renames, or repurposes a module) or the
+   building-block / runtime view, update the relevant chapter under
+   `docs/arc42/` in the **same PR**. Architecture overview and ADRs live in
+   `docs/arc42/` (chapters 01–12).
+4. Describe what changed and link the openspec change directory.
