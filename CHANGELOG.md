@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
+### Added
+
+- **Run module split** — `src/run.rs` factored into `src/run/` (`mod`, `cost`,
+  `dry_run`, `loop`, `recover`, `results`, `reuse`, `status`); behavior unchanged.
+- **Usable model list** — `docs/workers.md` (PROVEN / CONDITIONAL / EXCLUDED with
+  one evidence line per model) plus `KNOWN_PROBLEM_MODELS` in `src/config.rs`:
+  `af validate` now warns (never blocks) when an enabled worker uses an
+  excluded model id; `max_in_flight` documented (mistral 2 lanes, glm-5.2-awq
+  serialized).
+
 ### Fixed
 
 - **Failure receipts carry the agent's own diagnosis.** A CLI worker that
@@ -97,5 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - N/A — initial release.
 
-[unreleased]: https://github.com/agentflow/agentflow/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/agentflow/agentflow/releases/tag/v0.1.0
+[unreleased]: https://github.com/tobias-weiss-ai-xr/agentflow-public/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/tobias-weiss-ai-xr/agentflow-public/releases/tag/v0.2.0
+[0.1.1]: https://github.com/tobias-weiss-ai-xr/agentflow-public/releases/tag/v0.1.1
+[0.1.0]: https://github.com/tobias-weiss-ai-xr/agentflow-public/releases/tag/v0.1.0
